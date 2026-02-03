@@ -1,1 +1,22 @@
+const http = require("http");
+
+const server = http.createServer((req, res) => {
+  if (req.url === "/" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end("<h2>Core Voice Gateway Test</h2><p>Running ✅</p><a href='/health'>/health</a>");
+    return;
+  }
+
+  if (req.url === "/health" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, service: "core-voice-gateway-test" }));
+    return;
+  }
+
+  res.writeHead(404, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "Not found", path: req.url }));
+});
+
+const port = process.env.PORT || 3000;
+server.listen(port, () => console.log("Listening on", port));
 
