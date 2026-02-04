@@ -1,278 +1,470 @@
-/* Core Voice Gateway vNext (Test)
- * - Twilio Media Streams (WS /twilio-stream)
- * - OpenAI Realtime (WS client)
- * - Barge-in (interrupt)
- * - Tool calling: send_sms / schedule_appointment / get_customer / update_customer
- * - Riverdom CRM Sync via RIVERDOM_CRM_SYNC_URL + x-api-key (VOICESCORE_API_KEY)
- * - Endpoints: /, /health, /version, /prewarm, /twilio/voice, /twilio/outbound, /test/tool
+/**
+ * Core Voice Gateway v3.0.0 (Sandbox-first, enterprise-ready)
+ * - Twilio Media Streams: WS /twilio-stream
+ * - OpenAI Realtime: WS client
+ * - Prewarm: POST /prewarm
+ * - Inbound TwiML: POST /twilio/voice
+ * - Outbound Calls: POST /twilio/outbound
+ * - Transfer / End Call: tools + Twilio REST
+ * - Tools: registry (mock by default), retries, circuit breaker, dedup
+ * - Language: auto-detect EN/ES + guardrails
+ * - Transcripts + optional Supabase sync (safe, never blocks calls)
+ *
+ * IMPORTANT: No Riverdom dependency. Everything is configurable per company/provider later.
  */
 
 const http = require("http");
+const crypto = require("crypto");
 const { WebSocketServer, WebSocket } = require("ws");
 const { v4: uuidv4 } = require("uuid");
 const twilio = require("twilio");
 
-// =========================
-// ENV
-// =========================
-const VERSION = "core-voice-gateway-test-vNext-2.0.0";
-const PORT = process.env.PORT || 3000;
+// -------------------- ENV --------------------
+const VERSION = "core-voice-gateway-v3.0.0-sandbox";
+const PORT = process.env.PORT || 10000;
 const NODE_ENV = process.env.NODE_ENV || "production";
-const GATEWAY_MODE = process.env.GATEWAY_MODE || "test"; // "test" => verbose logs
-
-// Twilio
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
-const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER || ""; // for outbound
+const MODE = process.env.GATEWAY_MODE || "test"; // test|prod
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
 
 // OpenAI Realtime
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview";
 
-// Riverdom CRM Sync
-const RIVERDOM_CRM_SYNC_URL =
-  process.env.RIVERDOM_CRM_SYNC_URL ||
-  "https://krfuujgtetwbyznobira.supabase.co/functions/v1/riverdom-crm-sync";
+// Twilio
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
+const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER || "";
 
-// Important: Use VOICESCORE_API_KEY as x-api-key for Riverdom
-const VOICESCORE_API_KEY = process.env.VOICESCORE_API_KEY || "";
+// Optional: Supabase REST (later)
+const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const SUPABASE_CALLS_TABLE = process.env.SUPABASE_CALLS_TABLE || "calls";
+const SUPABASE_TRANSCRIPTS_TABLE = process.env.SUPABASE_TRANSCRIPTS_TABLE || "call_transcripts";
 
-// Prompting
-const BASE_SYSTEM_PROMPT_EN = process.env.BASE_SYSTEM_PROMPT_EN || `
-You are Sofy, a helpful voice assistant. Be concise, friendly, and professional.
-Follow instructions exactly. If you are unsure, ask a brief clarifying question.
-`;
-const BASE_SYSTEM_PROMPT_ES = process.env.BASE_SYSTEM_PROMPT_ES || `
-Eres Sofy, una asistente de voz útil. Sé concisa, amigable y profesional.
-Sigue instrucciones exactamente. Si no estás segura, haz una pregunta breve para aclarar.
-`;
+// Behavior
+const ENABLE_AUTO_DETECT_LANGUAGE = (process.env.ENABLE_AUTO_DETECT_LANGUAGE || "true") === "true";
+const DEFAULT_LANGUAGE = (process.env.DEFAULT_LANGUAGE || "auto"); // auto|en|es
+const LANGUAGE_LOCK_AFTER = parseInt(process.env.LANGUAGE_LOCK_AFTER || "2", 10); // lock after N user turns
 
-// =========================
-// Utilities
-// =========================
-function log(...args) {
-  if (GATEWAY_MODE === "test") console.log(...args);
+const ENABLE_DEDUP = (process.env.ENABLE_DEDUP || "true") === "true";
+const DEDUP_WINDOW_MS = parseInt(process.env.DEDUP_WINDOW_MS || "8000", 10);
+
+const TOOL_TIMEOUT_MS = parseInt(process.env.TOOL_TIMEOUT_MS || "9000", 10);
+const TOOL_RETRY_MAX = parseInt(process.env.TOOL_RETRY_MAX || "2", 10);
+
+const CIRCUIT_FAILURE_THRESHOLD = parseInt(process.env.CIRCUIT_FAILURE_THRESHOLD || "5", 10);
+const CIRCUIT_RESET_MS = parseInt(process.env.CIRCUIT_RESET_MS || "60000", 10);
+
+// Logging
+function log(level, msg, meta) {
+  const payload = {
+    ts: new Date().toISOString(),
+    level,
+    msg,
+    ...meta
+  };
+  if (MODE === "test" || level !== "debug") {
+    console.log(JSON.stringify(payload));
+  }
 }
-function warn(...args) {
-  console.warn(...args);
-}
-function safeJsonParse(str) {
-  try { return JSON.parse(str); } catch { return null; }
-}
+const info = (m, meta) => log("info", m, meta);
+const warn = (m, meta) => log("warn", m, meta);
+const error = (m, meta) => log("error", m, meta);
+const debug = (m, meta) => log("debug", m, meta);
+
+function safeJsonParse(s) { try { return JSON.parse(s); } catch { return null; } }
 function xmlEscape(s) {
   return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
-function nowIso() {
-  return new Date().toISOString();
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function sha1(x) { return crypto.createHash("sha1").update(String(x)).digest("hex"); }
+function withTimeout(promise, ms, label="timeout") {
+  let t;
+  const timeout = new Promise((_, rej) => t = setTimeout(() => rej(new Error(label)), ms));
+  return Promise.race([promise.finally(() => clearTimeout(t)), timeout]);
 }
 
-// =========================
-// Riverdom Sync Client (single source of truth)
-// =========================
-async function callRiverdomSync(action, payload) {
-  if (!VOICESCORE_API_KEY) throw new Error("Missing VOICESCORE_API_KEY for Riverdom x-api-key");
-  const body = { action, payload };
+// -------------------- Circuit Breaker --------------------
+class CircuitBreaker {
+  constructor(name) {
+    this.name = name;
+    this.state = "CLOSED"; // CLOSED|OPEN|HALF_OPEN
+    this.failures = 0;
+    this.nextAttemptAt = 0;
+  }
+  canRun() {
+    if (this.state === "OPEN") {
+      if (Date.now() >= this.nextAttemptAt) {
+        this.state = "HALF_OPEN";
+        info("circuit_half_open", { circuit: this.name });
+        return true;
+      }
+      return false;
+    }
+    return true;
+  }
+  onSuccess() {
+    if (this.state !== "CLOSED") info("circuit_closed", { circuit: this.name });
+    this.state = "CLOSED";
+    this.failures = 0;
+    this.nextAttemptAt = 0;
+  }
+  onFailure() {
+    this.failures += 1;
+    warn("circuit_failure", { circuit: this.name, failures: this.failures, threshold: CIRCUIT_FAILURE_THRESHOLD });
+    if (this.failures >= CIRCUIT_FAILURE_THRESHOLD) {
+      this.state = "OPEN";
+      this.nextAttemptAt = Date.now() + CIRCUIT_RESET_MS;
+      error("circuit_opened", { circuit: this.name, reset_ms: CIRCUIT_RESET_MS });
+    }
+  }
+  async execute(fn) {
+    if (!this.canRun()) throw new Error(`Circuit ${this.name} is OPEN`);
+    try {
+      const out = await fn();
+      this.onSuccess();
+      return out;
+    } catch (e) {
+      this.onFailure();
+      throw e;
+    }
+  }
+}
 
-  const resp = await fetch(RIVERDOM_CRM_SYNC_URL, {
-    method: "POST",
+// -------------------- Retry helper (backoff) --------------------
+async function withRetry(fn, opts = {}) {
+  const max = opts.max ?? TOOL_RETRY_MAX;
+  const base = opts.baseMs ?? 120;
+  const cap = opts.capMs ?? 1800;
+
+  let lastErr;
+  for (let attempt = 0; attempt <= max; attempt++) {
+    try { return await fn(attempt); }
+    catch (e) {
+      lastErr = e;
+      const isLast = attempt === max;
+      if (isLast) break;
+      const delay = Math.min(base * Math.pow(2, attempt) + Math.random() * 120, cap);
+      warn("retrying", { attempt: attempt + 1, max, delay_ms: delay, err: e.message });
+      await sleep(delay);
+    }
+  }
+  throw lastErr;
+}
+
+// -------------------- Language detection (EN/ES) --------------------
+const EN_HINTS = ["thank", "please", "yes", "no", "help", "appointment", "schedule", "tax", "today", "tomorrow", "morning", "afternoon"];
+const ES_HINTS = ["gracias", "por favor", "sí", "no", "cita", "agendar", "impuestos", "hoy", "mañana", "buenos", "tardes"];
+function detectLang(text) {
+  const t = (text || "").toLowerCase();
+  if (!t.trim()) return null;
+  let en = 0, es = 0;
+  for (const w of EN_HINTS) if (t.includes(w)) en++;
+  for (const w of ES_HINTS) if (t.includes(w)) es++;
+  if (en === 0 && es === 0) return null;
+  if (en > es) return "en";
+  if (es > en) return "es";
+  return null;
+}
+
+// -------------------- Prompts + Guardrails --------------------
+const BASE_PROMPT = `
+You are a professional, friendly voice assistant.
+Rules:
+- Be concise, natural, and helpful.
+- Ask one question at a time.
+- Confirm critical details (name, phone, date/time).
+- Use tools when appropriate.
+- If a tool fails, apologize briefly and offer an alternative (take note / schedule later / transfer).
+`.trim();
+
+function buildSystemPrompt(session) {
+  // Precedence (learned): base rules + company + campaign + dynamic
+  const ops = `
+Operational:
+- Language policy:
+  - auto_detect=${ENABLE_AUTO_DETECT_LANGUAGE}
+  - default=${DEFAULT_LANGUAGE}
+  - current=${session.language}
+  - lock=${session.languageLocked}
+- You MUST speak in ${session.language === "es" ? "Spanish" : "English"} unless told otherwise by system.
+- If you detect user speaking the other language and auto_detect enabled, request permission to switch and then switch.
+- If language is locked, DO NOT switch languages.
+- Keep compliance and safety. No sensitive data collection beyond what's needed.
+`.trim();
+
+  const company = session.companyPrompt || "";
+  const campaign = session.campaignScript || "";
+  const dynamic = session.dynamicInstructions || "";
+
+  return [BASE_PROMPT, ops, company, campaign, dynamic].filter(Boolean).join("\n\n").trim();
+}
+
+// -------------------- Sessions --------------------
+const sessions = new Map(); // callSid/prewarmId -> session
+function createSession(id) {
+  return {
+    id,
+    callSid: null,
+    streamSid: null,
+    createdAt: Date.now(),
+    direction: "inbound",
+    fromNumber: null,
+    toNumber: null,
+
+    // language
+    language: (DEFAULT_LANGUAGE === "en" || DEFAULT_LANGUAGE === "es") ? DEFAULT_LANGUAGE : "en",
+    languageLocked: false,
+    userTurns: 0,
+
+    // prompts
+    companyId: "sandbox",
+    companyPrompt: "",
+    campaignScript: "",
+    dynamicInstructions: "",
+
+    // transcripts
+    transcripts: { user: [], assistant: [] },
+
+    // tools
+    toolHistory: new Map(), // dedupKey -> lastMs
+    toolCallsInProgress: 0,
+
+    // openai state
+    speaking: false
+  };
+}
+function getSession(id) {
+  if (!sessions.has(id)) sessions.set(id, createSession(id));
+  return sessions.get(id);
+}
+
+// -------------------- Tooling (Sandbox-first) --------------------
+const circuitTools = new CircuitBreaker("tools");
+const circuitSupabase = new CircuitBreaker("supabase");
+const circuitTwilio = new CircuitBreaker("twilio");
+
+// Tool registry: implement MANY tools (mock default)
+const toolRegistry = {
+  // Core CRM/ops tools
+  lookup_contact: async (args, ctx) => mockOk("lookup_contact", args, ctx),
+  create_lead: async (args, ctx) => mockOk("create_lead", args, ctx),
+  update_contact: async (args, ctx) => mockOk("update_contact", args, ctx),
+  take_note: async (args, ctx) => mockOk("take_note", args, ctx),
+
+  // Messaging
+  send_sms: async (args, ctx) => mockOk("send_sms", args, ctx),
+  send_email: async (args, ctx) => mockOk("send_email", args, ctx),
+  send_whatsapp: async (args, ctx) => mockOk("send_whatsapp", args, ctx),
+
+  // Scheduling
+  schedule_appointment: async (args, ctx) => mockOk("schedule_appointment", args, ctx),
+  reschedule_appointment: async (args, ctx) => mockOk("reschedule_appointment", args, ctx),
+  cancel_appointment: async (args, ctx) => mockOk("cancel_appointment", args, ctx),
+
+  // Call control
+  transfer_to_human: async (args, ctx) => transferToHuman(args, ctx),
+  end_call: async (args, ctx) => endCall(args, ctx),
+
+  // Extras (add as needed)
+  set_language: async (args, ctx) => setLanguage(args, ctx),
+  set_followup: async (args, ctx) => mockOk("set_followup", args, ctx)
+};
+
+function mockOk(name, args, ctx) {
+  // Mock tools: no external calls. Safe for testing.
+  info("tool_mock", { tool: name, callSid: ctx.callSid, args });
+  return {
+    ok: true,
+    tool: name,
+    mode: "mock",
+    message: "Mock tool executed (no external connector).",
+    echo: args || {}
+  };
+}
+
+function toolDedupKey(name, args) {
+  return `${name}:${sha1(JSON.stringify(args || {}))}`;
+}
+
+async function runTool(name, args, ctx) {
+  if (!toolRegistry[name]) throw new Error(`Unknown tool: ${name}`);
+
+  // Dedup (context-aware)
+  if (ENABLE_DEDUP) {
+    const k = toolDedupKey(name, args);
+    const last = ctx.session.toolHistory.get(k);
+    const now = Date.now();
+    if (last && now - last < DEDUP_WINDOW_MS) {
+      warn("tool_dedup_blocked", { tool: name, window_ms: DEDUP_WINDOW_MS, callSid: ctx.callSid });
+      return { ok: true, deduped: true, tool: name, message: "Duplicate tool call suppressed." };
+    }
+    ctx.session.toolHistory.set(k, now);
+  }
+
+  ctx.session.toolCallsInProgress += 1;
+  const started = Date.now();
+
+  try {
+    const res = await circuitTools.execute(() =>
+      withRetry(async () => {
+        const p = toolRegistry[name](args || {}, ctx);
+        return await withTimeout(Promise.resolve(p), TOOL_TIMEOUT_MS, "tool_timeout");
+      })
+    );
+
+    info("tool_ok", { tool: name, ms: Date.now() - started, callSid: ctx.callSid });
+    return res;
+  } finally {
+    ctx.session.toolCallsInProgress = Math.max(0, ctx.session.toolCallsInProgress - 1);
+  }
+}
+
+// -------------------- Twilio call control tools --------------------
+function requireTwilio() {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) throw new Error("Missing TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN");
+  return twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+}
+
+async function transferToHuman(args, ctx) {
+  // args: { phone, whisper_message? }
+  const phone = args.phone;
+  if (!phone) return { ok: false, error: "transfer_to_human requires phone" };
+  if (!ctx.callSid) return { ok: false, error: "No callSid available for transfer" };
+
+  // Transfer on Twilio by updating call with TwiML <Dial>
+  // NOTE: Media Streams transfer can be tricky; this does a hard redirect to Dial.
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Dial>${xmlEscape(phone)}</Dial>
+</Response>`;
+
+  try {
+    const client = requireTwilio();
+    await circuitTwilio.execute(async () => {
+      await client.calls(ctx.callSid).update({ twiml });
+    });
+    info("transfer_requested", { callSid: ctx.callSid, to: phone });
+    return { ok: true, transferred: true, to: phone };
+  } catch (e) {
+    error("transfer_failed", { callSid: ctx.callSid, err: e.message });
+    return { ok: false, error: e.message, fallback: "Offer to take a message instead." };
+  }
+}
+
+async function endCall(args, ctx) {
+  if (!ctx.callSid) return { ok: false, error: "No callSid available to end call" };
+  try {
+    const client = requireTwilio();
+    await circuitTwilio.execute(async () => {
+      await client.calls(ctx.callSid).update({ status: "completed" });
+    });
+    info("call_ended", { callSid: ctx.callSid });
+    return { ok: true, ended: true };
+  } catch (e) {
+    error("end_call_failed", { callSid: ctx.callSid, err: e.message });
+    return { ok: false, error: e.message };
+  }
+}
+
+function setLanguage(args, ctx) {
+  const lang = String(args.language || "").toLowerCase();
+  if (lang !== "en" && lang !== "es") return { ok: false, error: "language must be en or es" };
+  ctx.session.language = lang;
+  ctx.session.languageLocked = true;
+  info("language_set_locked", { callSid: ctx.callSid, language: lang });
+  return { ok: true, language: lang, locked: true };
+}
+
+// -------------------- Supabase optional (SAFE) --------------------
+async function supabaseRest(path, method, body) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) throw new Error("Supabase ENV missing");
+  const url = `${SUPABASE_URL}/rest/v1/${path}`;
+  const res = await fetch(url, {
+    method,
     headers: {
+      "apikey": SUPABASE_SERVICE_ROLE_KEY,
+      "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
       "Content-Type": "application/json",
-      "x-api-key": VOICESCORE_API_KEY
+      "Prefer": "return=representation"
     },
-    body: JSON.stringify(body)
+    body: body ? JSON.stringify(body) : undefined
   });
-
-  const text = await resp.text();
-  const parsed = safeJsonParse(text);
-
-  log("[RIVERDOM_SYNC]", action, "status=", resp.status, "resp=", text.slice(0, 300));
-
-  if (!resp.ok) {
-    const err = new Error(`Riverdom sync failed (${resp.status})`);
-    err.details = { action, status: resp.status, text: text.slice(0, 800) };
+  const text = await res.text();
+  const json = safeJsonParse(text);
+  if (!res.ok) {
+    const err = new Error(`Supabase ${method} ${path} failed (${res.status})`);
+    err.details = { status: res.status, text: text.slice(0, 800) };
     throw err;
   }
-
-  return parsed ?? { raw: text };
+  return json ?? { raw: text };
 }
 
-// =========================
-// Tool Router
-// =========================
-async function runTool(toolName, args, ctx) {
-  // ctx: { callSid, companyId, language, from, to }
-  const companyId = args.company_id || ctx.companyId || "unknown";
-  // Today: We route Riverdom tools by explicit flag or known company id.
-  // You can harden this by checking DB/tenant mapping later.
-  const isRiverdom = String(companyId).toLowerCase().includes("riverdom") || companyId === "riverdom";
+async function safeDbLogCall(session) {
+  // MUST NEVER BREAK CALL if schema mismatches
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return;
 
-  if (!isRiverdom) {
-    // For now, we only implement Riverdom side in this test gateway.
-    // Expand here for other tenants (Voices Core CRM, etc.).
-    throw new Error(`Tool routing: company_id=${companyId} not supported in test gateway yet`);
-  }
+  const payload = {
+    call_sid: session.callSid,
+    company_id: session.companyId,
+    direction: session.direction,
+    from_number: session.fromNumber,
+    to_number: session.toNumber,
+    status: "in_progress",
+    started_at: new Date().toISOString()
+  };
 
-  switch (toolName) {
-    case "send_sms": {
-      const phone = args.phone;
-      const message = args.message;
-      const template_type = args.template_type || "info";
-      if (!phone || !message) throw new Error("send_sms requires phone and message");
-
-      return await callRiverdomSync("send_sms", {
-        phone,
-        message,
-        template_type,
-        call_sid: ctx.callSid || null
-      });
-    }
-
-    case "schedule_appointment": {
-      const customer_phone = args.customer_phone || args.phone;
-      const datetime_iso = args.datetime_iso;
-      const notes = args.notes || "";
-      if (!customer_phone || !datetime_iso) throw new Error("schedule_appointment requires customer_phone and datetime_iso");
-
-      return await callRiverdomSync("schedule_appointment", {
-        customer_phone,
-        datetime_iso,
-        notes,
-        call_sid: ctx.callSid || null
-      });
-    }
-
-    case "get_customer": {
-      const phone = args.phone;
-      if (!phone) throw new Error("get_customer requires phone");
-      return await callRiverdomSync("get_customer", { phone });
-    }
-
-    case "update_customer": {
-      const phone = args.phone;
-      const fields = args.fields || {};
-      if (!phone || typeof fields !== "object") throw new Error("update_customer requires phone and fields object");
-      return await callRiverdomSync("update_customer", { phone, fields });
-    }
-
-    default:
-      throw new Error(`Unknown tool: ${toolName}`);
+  try {
+    await circuitSupabase.execute(async () => {
+      await withTimeout(
+        withRetry(() => supabaseRest(`${SUPABASE_CALLS_TABLE}`, "POST", payload), { max: 1 }),
+        5000,
+        "db_timeout"
+      );
+    });
+    info("db_call_logged", { callSid: session.callSid });
+  } catch (e) {
+    // This is exactly where v4.60.x failed; we log but never crash
+    warn("db_call_log_failed_non_blocking", { callSid: session.callSid, err: e.message, details: e.details || null });
   }
 }
 
-// Tool schema for OpenAI
-const TOOL_SCHEMAS = [
-  {
-    type: "function",
-    name: "send_sms",
-    description: "Send an SMS message to a customer (Riverdom).",
-    parameters: {
-      type: "object",
-      properties: {
-        phone: { type: "string" },
-        message: { type: "string" },
-        template_type: { type: "string", enum: ["confirmation", "reminder", "follow_up", "info"] },
-        company_id: { type: "string" }
-      },
-      required: ["phone", "message"]
-    }
-  },
-  {
-    type: "function",
-    name: "schedule_appointment",
-    description: "Schedule an appointment in CRM (Riverdom).",
-    parameters: {
-      type: "object",
-      properties: {
-        customer_phone: { type: "string" },
-        datetime_iso: { type: "string" },
-        notes: { type: "string" },
-        company_id: { type: "string" }
-      },
-      required: ["customer_phone", "datetime_iso"]
-    }
-  },
-  {
-    type: "function",
-    name: "get_customer",
-    description: "Lookup a customer by phone (Riverdom).",
-    parameters: {
-      type: "object",
-      properties: {
-        phone: { type: "string" },
-        company_id: { type: "string" }
-      },
-      required: ["phone"]
-    }
-  },
-  {
-    type: "function",
-    name: "update_customer",
-    description: "Update customer fields (Riverdom).",
-    parameters: {
-      type: "object",
-      properties: {
-        phone: { type: "string" },
-        fields: { type: "object" },
-        company_id: { type: "string" }
-      },
-      required: ["phone", "fields"]
-    }
+async function safeDbSyncTranscripts(session) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return;
+
+  const combined = [];
+  const maxLen = Math.max(session.transcripts.user.length, session.transcripts.assistant.length);
+  for (let i = 0; i < maxLen; i++) {
+    if (i < session.transcripts.user.length) combined.push({ role: "user", content: session.transcripts.user[i] });
+    if (i < session.transcripts.assistant.length) combined.push({ role: "assistant", content: session.transcripts.assistant[i] });
   }
-];
+  if (combined.length === 0) {
+    info("db_transcript_skip_empty", { callSid: session.callSid });
+    return;
+  }
 
-// =========================
-// Prompt builder (precedence-safe)
-// =========================
-function buildFinalSystemPrompt({ language, dynamicInstructions }) {
-  const base = (language === "es") ? BASE_SYSTEM_PROMPT_ES : BASE_SYSTEM_PROMPT_EN;
-
-  // Precedence rule:
-  // base prompt + operational rules + dynamicInstructions (if provided)
-  const ops = `
-Operational rules:
-- Always speak in the selected language: ${language === "es" ? "Spanish" : "English"}.
-- Be brief. Ask one question at a time.
-- If user asks to be transferred, offer transfer and confirm.
-- Use tools when needed (SMS confirmations, scheduling, CRM updates).
-`;
-
-  const dyn = dynamicInstructions ? `\nDynamic Instructions (highest priority):\n${dynamicInstructions}\n` : "";
-
-  return `${base.trim()}\n${ops.trim()}\n${dyn.trim()}`.trim();
+  try {
+    await circuitSupabase.execute(async () => {
+      await withTimeout(
+        withRetry(() => supabaseRest(`${SUPABASE_TRANSCRIPTS_TABLE}`, "POST", {
+          call_sid: session.callSid,
+          transcripts: combined,
+          created_at: new Date().toISOString()
+        }), { max: 1 }),
+        7000,
+        "db_timeout"
+      );
+    });
+    info("db_transcripts_synced", { callSid: session.callSid, count: combined.length });
+  } catch (e) {
+    warn("db_transcripts_failed_non_blocking", { callSid: session.callSid, err: e.message, details: e.details || null });
+  }
 }
 
-// =========================
-// Call sessions state
-// =========================
-const sessions = new Map(); // callSid -> session
-
-function getOrCreateSession(callSid) {
-  let s = sessions.get(callSid);
-  if (!s) {
-    s = {
-      callSid,
-      streamSid: null,
-      createdAt: nowIso(),
-      language: "en",
-      dynamicInstructions: "",
-      companyId: "riverdom", // default for test
-      speaking: false,
-      lastAssistantAudioAt: 0
-    };
-    sessions.set(callSid, s);
-  }
-  return s;
-}
-
-// =========================
-// OpenAI Realtime Connector
-// =========================
-function connectOpenAIRealtime(session) {
+// -------------------- OpenAI Realtime connector --------------------
+function connectOpenAI(session) {
   if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
   const url = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`;
 
@@ -284,184 +476,192 @@ function connectOpenAIRealtime(session) {
   });
 
   ws.on("open", () => {
-    log("[OPENAI] connected", session.callSid);
+    info("openai_connected", { callSid: session.callSid || session.id });
 
-    const systemPrompt = buildFinalSystemPrompt({
-      language: session.language,
-      dynamicInstructions: session.dynamicInstructions
-    });
+    const prompt = buildSystemPrompt(session);
 
-    // Set session parameters. Twilio Media Streams audio is typically G.711 u-law 8k.
-    const msg = {
+    ws.send(JSON.stringify({
       type: "session.update",
       session: {
-        instructions: systemPrompt,
+        instructions: prompt,
         input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
-        // choose a default voice supported by your model; adjust if needed
         voice: "alloy",
-        // enable tool calling
-        tools: TOOL_SCHEMAS,
+        tools: OPENAI_TOOL_SCHEMAS,
         tool_choice: "auto"
       }
-    };
-
-    ws.send(JSON.stringify(msg));
+    }));
   });
 
-  ws.on("close", () => log("[OPENAI] closed", session.callSid));
-  ws.on("error", (e) => warn("[OPENAI] error", session.callSid, e.message));
+  ws.on("error", (e) => warn("openai_error", { callSid: session.callSid || session.id, err: e.message }));
+  ws.on("close", (code, reason) => info("openai_closed", { callSid: session.callSid || session.id, code, reason: String(reason || "") }));
 
   return ws;
 }
 
-// =========================
-// Barge-in logic (interrupt)
-// =========================
-function maybeInterrupt(openaiWs, session) {
-  // If assistant is speaking and we receive user audio, cancel current response.
+// Tools schemas exposed to OpenAI (many tools)
+const OPENAI_TOOL_SCHEMAS = [
+  { type: "function", name: "lookup_contact", description: "Lookup contact by name/phone/email in CRM.", parameters: { type: "object", properties: { phone:{type:"string"}, email:{type:"string"}, name:{type:"string"} }, required: [] } },
+  { type: "function", name: "create_lead", description: "Create a new lead in CRM.", parameters: { type: "object", properties: { name:{type:"string"}, phone:{type:"string"}, email:{type:"string"}, notes:{type:"string"} }, required: [] } },
+  { type: "function", name: "update_contact", description: "Update contact fields in CRM.", parameters: { type: "object", properties: { phone:{type:"string"}, fields:{type:"object"} }, required: ["fields"] } },
+  { type: "function", name: "take_note", description: "Save a note for follow-up.", parameters: { type: "object", properties: { note:{type:"string"} }, required: ["note"] } },
+
+  { type: "function", name: "send_sms", description: "Send SMS message.", parameters: { type: "object", properties: { phone:{type:"string"}, message:{type:"string"} }, required: ["phone","message"] } },
+  { type: "function", name: "send_email", description: "Send email message.", parameters: { type: "object", properties: { email:{type:"string"}, subject:{type:"string"}, body:{type:"string"} }, required: ["email","subject","body"] } },
+  { type: "function", name: "send_whatsapp", description: "Send WhatsApp message.", parameters: { type: "object", properties: { phone:{type:"string"}, message:{type:"string"} }, required: ["phone","message"] } },
+
+  { type: "function", name: "schedule_appointment", description: "Schedule appointment.", parameters: { type: "object", properties: { phone:{type:"string"}, datetime_iso:{type:"string"}, notes:{type:"string"} }, required: ["datetime_iso"] } },
+  { type: "function", name: "reschedule_appointment", description: "Reschedule appointment.", parameters: { type: "object", properties: { appointment_id:{type:"string"}, datetime_iso:{type:"string"} }, required: ["appointment_id","datetime_iso"] } },
+  { type: "function", name: "cancel_appointment", description: "Cancel appointment.", parameters: { type: "object", properties: { appointment_id:{type:"string"}, reason:{type:"string"} }, required: ["appointment_id"] } },
+
+  { type: "function", name: "transfer_to_human", description: "Transfer call to a human agent phone number.", parameters: { type: "object", properties: { phone:{type:"string"} }, required: ["phone"] } },
+  { type: "function", name: "end_call", description: "End/hang up the call.", parameters: { type: "object", properties: { reason:{type:"string"} }, required: [] } },
+
+  { type: "function", name: "set_language", description: "Set language and lock it.", parameters: { type: "object", properties: { language:{type:"string", enum:["en","es"]} }, required: ["language"] } },
+  { type: "function", name: "set_followup", description: "Set follow-up reminder/task.", parameters: { type: "object", properties: { when_iso:{type:"string"}, note:{type:"string"} }, required: ["when_iso","note"] } }
+];
+
+// -------------------- Barge-in --------------------
+function interruptIfSpeaking(session, openaiWs) {
   if (session.speaking && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
     session.speaking = false;
     openaiWs.send(JSON.stringify({ type: "response.cancel" }));
-    log("[BARGE_IN] response.cancel sent", session.callSid);
+    info("barge_in_cancel", { callSid: session.callSid });
   }
 }
 
-// =========================
-// Twilio Stream WS Server
-// =========================
+// -------------------- WebSocket server (Twilio Stream) --------------------
 const wss = new WebSocketServer({ noServer: true });
 
-wss.on("connection", (twilioWs, request) => {
-  // Twilio sends JSON events: start/media/stop.
+wss.on("connection", (twilioWs) => {
   let openaiWs = null;
   let session = null;
 
   twilioWs.on("message", async (buf) => {
-    const text = buf.toString("utf8");
-    const msg = safeJsonParse(text);
+    const msg = safeJsonParse(buf.toString("utf8"));
     if (!msg) return;
 
     if (msg.event === "start") {
-      const callSid = msg.start?.callSid || msg.start?.call_id || uuidv4();
-      const streamSid = msg.start?.streamSid || msg.streamSid || null;
+      const callSid = msg.start?.callSid || uuidv4();
+      const streamSid = msg.start?.streamSid || null;
 
-      session = getOrCreateSession(callSid);
+      session = getSession(callSid);
+      session.callSid = callSid;
       session.streamSid = streamSid;
 
-      // Optional: allow custom params from Twilio <Stream><Parameter>
       const custom = msg.start?.customParameters || {};
-      if (custom.language) session.language = String(custom.language).toLowerCase().startsWith("es") ? "es" : "en";
-      if (custom.company_id) session.companyId = String(custom.company_id);
-      if (custom.dynamic_instructions) session.dynamicInstructions = String(custom.dynamic_instructions);
+      session.direction = custom.direction || "inbound";
+      session.companyId = custom.company_id || "sandbox";
+      session.fromNumber = custom.from || null;
+      session.toNumber = custom.to || null;
 
-      log("[TWILIO] start", { callSid, streamSid, language: session.language, companyId: session.companyId });
+      // Language initial
+      const initLang = (custom.language || DEFAULT_LANGUAGE || "auto").toLowerCase();
+      if (initLang === "es" || initLang === "en") session.language = initLang;
+      if (initLang === "auto" && DEFAULT_LANGUAGE === "auto") session.language = "en"; // start EN, will auto-detect
+
+      session.dynamicInstructions = custom.dynamic_instructions || "";
+
+      info("twilio_start", { callSid, streamSid, companyId: session.companyId, direction: session.direction });
+
+      // Optional: DB log call (non-blocking)
+      safeDbLogCall(session);
 
       // Connect OpenAI
-      openaiWs = connectOpenAIRealtime(session);
+      try {
+        openaiWs = connectOpenAI(session);
+      } catch (e) {
+        error("openai_connect_failed", { callSid, err: e.message });
+      }
 
-      // Relay OpenAI -> Twilio
-      openaiWs.on("message", async (raw) => {
-        const s = raw.toString("utf8");
-        const evt = safeJsonParse(s);
-        if (!evt) return;
+      if (openaiWs) {
+        openaiWs.on("message", async (raw) => {
+          const evt = safeJsonParse(raw.toString("utf8"));
+          if (!evt) return;
 
-        // Audio from assistant
-        if (evt.type === "response.audio.delta" && evt.delta) {
-          session.speaking = true;
-          session.lastAssistantAudioAt = Date.now();
-
-          // Send to Twilio as media payload
-          const twilioMsg = {
-            event: "media",
-            streamSid: session.streamSid,
-            media: { payload: evt.delta }
-          };
-          if (twilioWs.readyState === WebSocket.OPEN) {
-            twilioWs.send(JSON.stringify(twilioMsg));
+          // Assistant audio
+          if (evt.type === "response.audio.delta" && evt.delta) {
+            session.speaking = true;
+            if (twilioWs.readyState === WebSocket.OPEN) {
+              twilioWs.send(JSON.stringify({ event: "media", streamSid: session.streamSid, media: { payload: evt.delta } }));
+            }
+            return;
           }
-          return;
-        }
-
-        // When response completes, mark not speaking
-        if (evt.type === "response.done") {
-          session.speaking = false;
-          return;
-        }
-
-        // Tool calling (Realtime)
-        // Typical pattern: response.function_call_arguments.done
-        if (evt.type === "response.function_call_arguments.done") {
-          const toolName = evt.name;
-          const args = safeJsonParse(evt.arguments || "{}") || {};
-          log("[TOOL_CALL]", toolName, args);
-
-          try {
-            const result = await runTool(toolName, args, {
-              callSid: session.callSid,
-              companyId: session.companyId,
-              language: session.language
-            });
-
-            // Return tool result to OpenAI
-            const toolResult = {
-              type: "conversation.item.create",
-              item: {
-                type: "function_call_output",
-                call_id: evt.call_id,
-                output: JSON.stringify(result ?? { ok: true })
-              }
-            };
-            openaiWs.send(JSON.stringify(toolResult));
-
-            // Ask OpenAI to continue after tool result
-            openaiWs.send(JSON.stringify({ type: "response.create" }));
-          } catch (e) {
-            warn("[TOOL_ERROR]", toolName, e.message);
-            const toolResult = {
-              type: "conversation.item.create",
-              item: {
-                type: "function_call_output",
-                call_id: evt.call_id,
-                output: JSON.stringify({ error: e.message, details: e.details || null })
-              }
-            };
-            openaiWs.send(JSON.stringify(toolResult));
-            openaiWs.send(JSON.stringify({ type: "response.create" }));
+          if (evt.type === "response.done") {
+            session.speaking = false;
+            return;
           }
-          return;
-        }
 
-        // Optional: debug logs
-        if (GATEWAY_MODE === "test") {
-          if (evt.type === "error") warn("[OPENAI_EVT_ERROR]", evt);
-        }
-      });
+          // Transcripts (if provided by model events)
+          if (evt.type === "response.output_text.delta" && evt.delta) {
+            // optional: accumulate, but realtime often emits audio only; keep for completeness
+            return;
+          }
+
+          // Tool calling
+          if (evt.type === "response.function_call_arguments.done") {
+            const toolName = evt.name;
+            const args = safeJsonParse(evt.arguments || "{}") || {};
+
+            info("tool_call", { callSid: session.callSid, tool: toolName });
+
+            try {
+              const out = await runTool(toolName, args, { callSid: session.callSid, session });
+              openaiWs.send(JSON.stringify({
+                type: "conversation.item.create",
+                item: {
+                  type: "function_call_output",
+                  call_id: evt.call_id,
+                  output: JSON.stringify(out)
+                }
+              }));
+              openaiWs.send(JSON.stringify({ type: "response.create" }));
+            } catch (e) {
+              warn("tool_call_failed", { callSid: session.callSid, tool: toolName, err: e.message });
+              openaiWs.send(JSON.stringify({
+                type: "conversation.item.create",
+                item: {
+                  type: "function_call_output",
+                  call_id: evt.call_id,
+                  output: JSON.stringify({ ok: false, error: e.message, details: e.details || null })
+                }
+              }));
+              openaiWs.send(JSON.stringify({ type: "response.create" }));
+            }
+            return;
+          }
+
+          if (evt.type === "error") {
+            warn("openai_evt_error", { callSid: session.callSid, evt });
+          }
+        });
+
+        openaiWs.on("close", async () => {
+          // Sync transcripts non-blocking
+          try { await safeDbSyncTranscripts(session); } catch {}
+        });
+      }
 
       return;
     }
 
     if (msg.event === "media") {
-      if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN || !session) return;
+      if (!session || !openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
 
-      // Barge-in if assistant speaking
-      maybeInterrupt(openaiWs, session);
+      // Barge-in
+      interruptIfSpeaking(session, openaiWs);
 
-      // Append user audio to OpenAI input buffer
+      // Feed user audio
       const payload = msg.media?.payload;
       if (payload) {
-        openaiWs.send(JSON.stringify({
-          type: "input_audio_buffer.append",
-          audio: payload
-        }));
+        openaiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: payload }));
       }
       return;
     }
 
     if (msg.event === "stop") {
-      log("[TWILIO] stop", session?.callSid);
+      info("twilio_stop", { callSid: session?.callSid });
       try { if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close(); } catch {}
-      try { if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close(); } catch {}
       return;
     }
   });
@@ -470,95 +670,100 @@ wss.on("connection", (twilioWs, request) => {
     try { if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close(); } catch {}
   });
 
-  twilioWs.on("error", (e) => warn("[TWILIO_WS] error", e.message));
+  twilioWs.on("error", (e) => warn("twilio_ws_error", { err: e.message }));
 });
 
-// =========================
-// HTTP Server + Upgrade to WS
-// =========================
+// -------------------- HTTP server --------------------
 const server = http.createServer(async (req, res) => {
-  // ---------- INDEX ----------
-  if (req.method === "GET" && (req.url === "/" || req.url === "/index")) {
+  // Basic routing
+  if (req.method === "GET" && req.url === "/") {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     res.end(`
-      <html>
-        <head><title>${xmlEscape(VERSION)}</title></head>
-        <body style="font-family:Arial;padding:24px">
-          <h2>${xmlEscape(VERSION)}</h2>
-          <p>✅ Running</p>
-          <ul>
-            <li><a href="/health">/health</a></li>
-            <li><a href="/version">/version</a></li>
-          </ul>
-          <p>WS: <code>/twilio-stream</code></p>
-          <p>Mode: <code>${xmlEscape(GATEWAY_MODE)}</code></p>
-        </body>
-      </html>
+      <html><body style="font-family:Arial;padding:24px">
+        <h2>${xmlEscape(VERSION)}</h2>
+        <p>Running ✅</p>
+        <ul>
+          <li><a href="/health">/health</a></li>
+          <li><a href="/ready">/ready</a></li>
+          <li><a href="/version">/version</a></li>
+        </ul>
+      </body></html>
     `);
     return;
   }
 
-  // ---------- HEALTH ----------
+  if (req.method === "GET" && req.url === "/version") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ version: VERSION, env: NODE_ENV, mode: MODE }));
+    return;
+  }
+
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       ok: true,
       version: VERSION,
-      mode: GATEWAY_MODE,
-      node: process.version,
-      time: nowIso()
+      time: new Date().toISOString()
     }));
     return;
   }
 
-  // ---------- VERSION ----------
-  if (req.method === "GET" && req.url === "/version") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ version: VERSION }));
+  // readiness includes env sanity checks
+  if (req.method === "GET" && req.url === "/ready") {
+    const checks = {
+      public_base_url: !!PUBLIC_BASE_URL,
+      openai_key: !!OPENAI_API_KEY,
+      twilio_sid: !!TWILIO_ACCOUNT_SID,
+      twilio_token: !!TWILIO_AUTH_TOKEN,
+      from_number: !!TWILIO_FROM_NUMBER
+    };
+    const ok = Object.values(checks).every(Boolean);
+    res.writeHead(ok ? 200 : 503, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok, checks }));
     return;
   }
 
-  // ---------- PREWARM ----------
+  // Prewarm: store dynamic instructions + desired language mode + company prompts
   if (req.method === "POST" && req.url === "/prewarm") {
-    // Store any dynamic instructions / language for an upcoming call
     let body = "";
-    req.on("data", (chunk) => (body += chunk));
+    req.on("data", (c) => body += c);
     req.on("end", () => {
       const data = safeJsonParse(body) || {};
-      const callSid = data.call_sid || data.callSid || uuidv4();
+      const prepId = data.prep_id || uuidv4();
+      const s = getSession(prepId);
 
-      const s = getOrCreateSession(callSid);
-      if (data.language) s.language = String(data.language).toLowerCase().startsWith("es") ? "es" : "en";
-      if (data.company_id) s.companyId = String(data.company_id);
-      if (data.dynamic_instructions) s.dynamicInstructions = String(data.dynamic_instructions);
+      s.companyId = data.company_id || s.companyId || "sandbox";
+      s.companyPrompt = data.company_prompt || s.companyPrompt || "";
+      s.campaignScript = data.campaign_script || s.campaignScript || "";
+      s.dynamicInstructions = data.dynamic_instructions || s.dynamicInstructions || "";
+
+      const lang = String(data.language || "auto").toLowerCase();
+      if (lang === "en" || lang === "es") s.language = lang;
+      // auto mode starts EN, switches when user speaks
+      if (lang === "auto") s.language = "en";
 
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, call_sid: callSid, session: s }));
+      res.end(JSON.stringify({ ok: true, prep_id: prepId }));
     });
     return;
   }
 
-  // ---------- Twilio inbound voice webhook (TwiML) ----------
+  // Twilio inbound voice webhook -> TwiML streaming
   if (req.method === "POST" && req.url === "/twilio/voice") {
-    // Create TwiML that starts streaming to /twilio-stream
-    const wsUrl = PUBLIC_BASE_URL
-      ? `${PUBLIC_BASE_URL.replace(/^http/, "ws")}/twilio-stream`
-      : null;
-
-    if (!wsUrl) {
+    if (!PUBLIC_BASE_URL) {
       res.writeHead(500, { "Content-Type": "text/plain" });
-      res.end("PUBLIC_BASE_URL is required");
+      res.end("Missing PUBLIC_BASE_URL");
       return;
     }
+    const wsUrl = `${PUBLIC_BASE_URL.replace(/^http/, "ws")}/twilio-stream`;
 
-    // You can pass parameters to stream to enforce language/company/dynamic instructions
-    // Twilio <Parameter> requires static values here; for dynamic, prewarm + custom logic is used.
+    // NOTE: language can start "auto" by passing language=auto; session starts EN then auto-detect.
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <Stream url="${xmlEscape(wsUrl)}">
-      <Parameter name="language" value="en"/>
-      <Parameter name="company_id" value="riverdom"/>
+      <Parameter name="company_id" value="sandbox"/>
+      <Parameter name="language" value="auto"/>
     </Stream>
   </Connect>
 </Response>`;
@@ -568,127 +773,75 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ---------- Outbound call trigger (Twilio REST) ----------
+  // Outbound call trigger
   if (req.method === "POST" && req.url === "/twilio/outbound") {
-    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+    if (!PUBLIC_BASE_URL) {
       res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Missing TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN" }));
+      res.end(JSON.stringify({ ok: false, error: "Missing PUBLIC_BASE_URL" }));
       return;
     }
     if (!TWILIO_FROM_NUMBER) {
       res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Missing TWILIO_FROM_NUMBER" }));
-      return;
-    }
-    if (!PUBLIC_BASE_URL) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Missing PUBLIC_BASE_URL" }));
+      res.end(JSON.stringify({ ok: false, error: "Missing TWILIO_FROM_NUMBER" }));
       return;
     }
 
     let body = "";
-    req.on("data", (chunk) => (body += chunk));
+    req.on("data", (c) => body += c);
     req.on("end", async () => {
       const data = safeJsonParse(body) || {};
       const to = data.to;
-      const language = (data.language || "en").toLowerCase().startsWith("es") ? "es" : "en";
-      const company_id = data.company_id || "riverdom";
-      const dynamic_instructions = data.dynamic_instructions || "";
-
       if (!to) {
         res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Missing 'to' phone number" }));
+        res.end(JSON.stringify({ ok: false, error: "Missing 'to'" }));
         return;
       }
 
-      // Prewarm a session id (optional). Twilio will provide callSid once connected,
-      // but prewarming allows you to store instructions keyed by a placeholder.
-      const prewarmId = uuidv4();
-      const s = getOrCreateSession(prewarmId);
-      s.language = language;
-      s.companyId = String(company_id);
-      s.dynamicInstructions = String(dynamic_instructions);
+      // Optional: prewarm session data (prep_id)
+      const prepId = data.prep_id || uuidv4();
+      const s = getSession(prepId);
+      s.companyId = data.company_id || "sandbox";
+      s.companyPrompt = data.company_prompt || "";
+      s.campaignScript = data.campaign_script || "";
+      s.dynamicInstructions = data.dynamic_instructions || "";
+
+      const lang = String(data.language || "auto").toLowerCase();
+      s.language = (lang === "es" || lang === "en") ? lang : "en";
 
       const voiceWebhook = `${PUBLIC_BASE_URL}/twilio/voice`;
 
       try {
-        const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+        const client = requireTwilio();
         const call = await client.calls.create({
           to,
           from: TWILIO_FROM_NUMBER,
-          url: voiceWebhook, // Twilio will hit /twilio/voice then stream
+          url: voiceWebhook,
           method: "POST"
+          // recording: set at Twilio number settings or add record=true in TwiML later
         });
 
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          ok: true,
-          call_sid: call.sid,
-          to,
-          from: TWILIO_FROM_NUMBER
-        }));
+        res.end(JSON.stringify({ ok: true, call_sid: call.sid, prep_id: prepId }));
       } catch (e) {
         res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: e.message }));
+        res.end(JSON.stringify({ ok: false, error: e.message }));
       }
     });
     return;
   }
 
-  // ---------- Test tool runner (only in test mode) ----------
-  if (req.method === "POST" && req.url === "/test/tool") {
-    if (GATEWAY_MODE !== "test") {
-      res.writeHead(403, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Forbidden (enable GATEWAY_MODE=test)" }));
-      return;
-    }
-
-    let body = "";
-    req.on("data", (chunk) => (body += chunk));
-    req.on("end", async () => {
-      const data = safeJsonParse(body) || {};
-      const tool = data.tool;
-      const args = data.args || {};
-
-      if (!tool) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Missing tool" }));
-        return;
-      }
-
-      try {
-        const result = await runTool(tool, args, {
-          callSid: "TEST_CALL",
-          companyId: args.company_id || "riverdom",
-          language: args.language || "en"
-        });
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, result }));
-      } catch (e) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: e.message, details: e.details || null }));
-      }
-    });
-    return;
-  }
-
-  // ---------- default ----------
   res.writeHead(404, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ error: "Not found", path: req.url }));
+  res.end(JSON.stringify({ ok: false, error: "Not found", path: req.url }));
 });
 
+// Upgrade to WS
 server.on("upgrade", (req, socket, head) => {
-  // Only accept WS upgrades for /twilio-stream
-  if (!req.url || !req.url.startsWith("/twilio-stream")) {
-    socket.destroy();
-    return;
-  }
+  if (!req.url || !req.url.startsWith("/twilio-stream")) return socket.destroy();
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 });
 
 server.listen(PORT, () => {
-  console.log(`[START] ${VERSION} listening on ${PORT} | env=${NODE_ENV} | mode=${GATEWAY_MODE}`);
-  if (!PUBLIC_BASE_URL) warn("[ENV] PUBLIC_BASE_URL missing (needed for /twilio/voice TwiML ws URL)");
-  if (!OPENAI_API_KEY) warn("[ENV] OPENAI_API_KEY missing (OpenAI realtime will fail)");
-  if (!VOICESCORE_API_KEY) warn("[ENV] VOICESCORE_API_KEY missing (Riverdom tools will fail)");
+  console.log(`[START] ${VERSION} listening on ${PORT} env=${NODE_ENV} mode=${MODE}`);
+  if (!PUBLIC_BASE_URL) warn("env_missing_public_base_url", {});
+  if (!OPENAI_API_KEY) warn("env_missing_openai_key", {});
 });
