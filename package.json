@@ -1,14 +1,10 @@
 {
   "name": "core-voice-gateway-test",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "private": true,
   "type": "commonjs",
-  "engines": {
-    "node": ">=20"
-  },
-  "scripts": {
-    "start": "node index"
-  },
+  "engines": { "node": ">=20" },
+  "scripts": { "start": "node index" },
   "dependencies": {
     "ws": "^8.18.0",
     "twilio": "^5.4.0",
