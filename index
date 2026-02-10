@@ -1,847 +1,2533 @@
 /**
- * Core Voice Gateway v3.0.0 (Sandbox-first, enterprise-ready)
- * - Twilio Media Streams: WS /twilio-stream
- * - OpenAI Realtime: WS client
- * - Prewarm: POST /prewarm
- * - Inbound TwiML: POST /twilio/voice
- * - Outbound Calls: POST /twilio/outbound
- * - Transfer / End Call: tools + Twilio REST
- * - Tools: registry (mock by default), retries, circuit breaker, dedup
- * - Language: auto-detect EN/ES + guardrails
- * - Transcripts + optional Supabase sync (safe, never blocks calls)
+ * ============================================================
+ * VOICE GATEWAY v6.2.0 â€” ENTERPRISE EDITION (Blue Core Ready)
+ * ============================================================
  *
- * IMPORTANT: No Riverdom dependency. Everything is configurable per company/provider later.
+ * Complete OOP architecture merging:
+ * - v6.0.0 Enterprise infrastructure (22 classes, resilience, observability)
+ * - v6.1.0 Blue Core business logic (bc_agents, dynB64, fmB64, forceNewSession,
+ *   business name detection, response locking, greeting system)
+ *
+ * ARCHITECTURE: 10 clearly separated sections with full OOP encapsulation.
+ *
+ * CLASSES (22):
+ *   Utilities:    Logger, Validator, Parser
+ *   Resilience:   RetryManager, CircuitBreaker, RateLimiter
+ *   State:        SessionManager
+ *   External:     SupabaseClient, CRMToolsClient, WebhookClient
+ *   Business:     LanguageDetector, VoicemailDetector, AutoHangupManager,
+ *                 SpamFilter, ToolDeduplicator, PromptBuilder, VoiceMapper,
+ *                 BusinessNameDetector, ResponseLockManager
+ *   Execution:    ToolExecutor
+ *   Handlers:     OpenAIHandler, TwilioHandler
+ *   Observability: MetricsCollector, HealthCheck
+ *
+ * KEY FEATURES:
+ * - Multi-tenant architecture (zero hardcoded company logic)
+ * - Circuit breakers & exponential backoff for all external services
+ * - Automatic language detection with dynamic switching
+ * - Rate limiting per tenant and per IP
+ * - Spam filtering and voicemail/IVR detection
+ * - Prewarm sessions with forceNewSession/skipPrewarm override
+ * - Dynamic instructions: full (replace) or addon (merge) modes
+ * - Base64 instruction decoding (dynB64, fmB64) from TwiML URL
+ * - Auto-hangup after goodbye pattern (5s timeout)
+ * - Tool deduplication with argument analysis
+ * - Response locking to prevent concurrent OpenAI responses
+ * - Business name detection (prevents greeting with company names)
+ * - Structured JSON logging with contextual information
+ * - Health checks with service status + metrics endpoint
+ * - Graceful shutdown (SIGTERM/SIGINT) with forced exit on fatal errors
+ * - Transcript sync to Supabase
+ * - Webhook support for post-call events
+ * - Blue Core (bc_agents, bc_companies, bc_call_prep_sessions) support
+ * - Full exports for testing
+ *
+ * BLUE CORE TEST DATA:
+ *   Company: bc000000-0000-0000-0000-000000000001 (Blue Core, sandbox)
+ *   Agent:   bc000000-0000-0000-0000-000000000002 (Nanyeli, es, openai voice)
+ *
+ * @version 6.2.0
+ * @license MIT
  */
 
-const http = require("http");
-const crypto = require("crypto");
-const { WebSocketServer, WebSocket } = require("ws");
-const { v4: uuidv4 } = require("uuid");
-const twilio = require("twilio");
+import WebSocket, { WebSocketServer } from "ws";
+import http from "http";
 
-// -------------------- ENV --------------------
-const VERSION = "core-voice-gateway-v3.0.0-sandbox";
+// ============================================================
+// SECTION 1: CONFIGURATION & CONSTANTS
+// ============================================================
+
+const VERSION = "6.2.0";
 const PORT = process.env.PORT || 10000;
-const NODE_ENV = process.env.NODE_ENV || "production";
-const MODE = process.env.GATEWAY_MODE || "test"; // test|prod
-const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
 
-// OpenAI Realtime
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview";
+// Environment variables (required)
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const VOICE_GATEWAY_TOKEN = process.env.VOICE_GATEWAY_TOKEN;
 
-// Twilio
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
-const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER || "";
+// Environment variables (optional)
+const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
+const ENABLE_WEBHOOKS = process.env.ENABLE_WEBHOOKS !== "false";
+const ENABLE_METRICS = process.env.ENABLE_METRICS !== "false";
 
-// Optional: Supabase REST (later)
-const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
-const SUPABASE_CALLS_TABLE = process.env.SUPABASE_CALLS_TABLE || "calls";
-const SUPABASE_TRANSCRIPTS_TABLE = process.env.SUPABASE_TRANSCRIPTS_TABLE || "call_transcripts";
+// External service URLs
+const CRM_TOOLS_URL = SUPABASE_URL + "/functions/v1/render-crm-tools";
+const UPSERT_CALL_RECORD_URL = SUPABASE_URL + "/functions/v1/upsert-call-record";
+const SYNC_TRANSCRIPT_URL = SUPABASE_URL + "/functions/v1/sync-transcript";
 
-// Behavior
-const ENABLE_AUTO_DETECT_LANGUAGE = (process.env.ENABLE_AUTO_DETECT_LANGUAGE || "true") === "true";
-const DEFAULT_LANGUAGE = (process.env.DEFAULT_LANGUAGE || "auto"); // auto|en|es
-const LANGUAGE_LOCK_AFTER = parseInt(process.env.LANGUAGE_LOCK_AFTER || "2", 10); // lock after N user turns
+// Timing constants
+const PREWARM_SESSION_TTL_MS = 90000;
+const PREWARM_CLEANUP_INTERVAL_MS = 15000;
+const SESSION_UPDATE_TIMEOUT_MS = 3000;
+const AUTO_HANGUP_TIMEOUT_MS = 5000;
+const RINGBACK_INTERVAL_MS = 100;
+const TOOL_EXECUTION_TIMEOUT_MS = 30000;
+const WEBHOOK_TIMEOUT_MS = 10000;
 
-const ENABLE_DEDUP = (process.env.ENABLE_DEDUP || "true") === "true";
-const DEDUP_WINDOW_MS = parseInt(process.env.DEDUP_WINDOW_MS || "8000", 10);
+// Retry constants
+const MAX_RETRIES = 3;
+const BASE_RETRY_DELAY_MS = 100;
+const MAX_RETRY_DELAY_MS = 5000;
 
-const TOOL_TIMEOUT_MS = parseInt(process.env.TOOL_TIMEOUT_MS || "9000", 10);
-const TOOL_RETRY_MAX = parseInt(process.env.TOOL_RETRY_MAX || "2", 10);
+// Circuit breaker constants
+const CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5;
+const CIRCUIT_BREAKER_RESET_TIMEOUT_MS = 60000;
 
-const CIRCUIT_FAILURE_THRESHOLD = parseInt(process.env.CIRCUIT_FAILURE_THRESHOLD || "5", 10);
-const CIRCUIT_RESET_MS = parseInt(process.env.CIRCUIT_RESET_MS || "60000", 10);
+// Rate limiting constants
+const RATE_LIMIT_CALLS_PER_TENANT_CONCURRENT = 50;
+const RATE_LIMIT_CALLS_PER_TENANT_HOUR = 1000;
+const RATE_LIMIT_REQUESTS_PER_IP_MINUTE = 60;
 
-// Logging
-function log(level, msg, meta) {
-  const payload = {
-    ts: new Date().toISOString(),
-    level,
-    msg,
-    ...meta
-  };
-  if (MODE === "test" || level !== "debug") {
-    console.log(JSON.stringify(payload));
+// Default values
+const DEFAULT_TIMEZONE = "America/New_York";
+const DEFAULT_LANGUAGE = "es";
+const DEFAULT_VOICE = "alloy";
+
+// Session pools
+const sessions = new Map();
+const prewarmSessions = new Map();
+const agentConfigCache = new Map();
+const tenantCallCounts = new Map();
+const ipRequestCounts = new Map();
+
+// Ringback silence frame (8kHz ulaw, ~100ms)
+const RINGBACK_SILENCE_FRAME = Buffer.alloc(800).toString("base64");
+
+// Valid OpenAI voices
+const VALID_OPENAI_VOICES = [
+  "alloy", "ash", "ballad", "coral", "echo",
+  "sage", "shimmer", "verse", "marin", "cedar"
+];
+
+// Supported languages (with detection patterns)
+const SUPPORTED_LANGUAGES = {
+  es: {
+    name: "Spanish",
+    patterns: [
+      /\b(hola|buenos dÃ­as|gracias|por favor|cÃ³mo estÃ¡s|sÃ­|no)\b/i,
+      /[Ã±Ã¡Ã©Ã­Ã³Ãº]/
+    ]
+  },
+  en: {
+    name: "English",
+    patterns: [
+      /\b(hello|hi|thank you|please|how are you|yes|no)\b/i
+    ]
   }
-}
-const info = (m, meta) => log("info", m, meta);
-const warn = (m, meta) => log("warn", m, meta);
-const error = (m, meta) => log("error", m, meta);
-const debug = (m, meta) => log("debug", m, meta);
+};
 
-function safeJsonParse(s) { try { return JSON.parse(s); } catch { return null; } }
-function xmlEscape(s) {
-  return String(s)
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-}
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-function sha1(x) { return crypto.createHash("sha1").update(String(x)).digest("hex"); }
-function withTimeout(promise, ms, label="timeout") {
-  let t;
-  const timeout = new Promise((_, rej) => t = setTimeout(() => rej(new Error(label)), ms));
-  return Promise.race([promise.finally(() => clearTimeout(t)), timeout]);
-}
+// Voicemail/IVR detection patterns
+const VOICEMAIL_PATTERNS = [
+  /leave\s+(a\s+)?message/i, /deja\s+(tu\s+)?mensaje/i,
+  /grabe\s+su\s+mensaje/i, /after\s+the\s+(beep|tone)/i,
+  /at\s+the\s+tone/i, /no\s+estÃ¡?\s+disponible/i,
+  /voicemail/i, /record\s+(your\s+)?message/i,
+  /press(ione)?\s+\d/i, /marque\s+\d/i, /opci[oÃ³]n\s+\d/i,
+  /para\s+.*\s+presione/i, /if\s+you\s+know\s+your\s+party/i,
+  /mailbox\s+is\s+full/i, /deje(\s+su)?\s+mensaje/i,
+  /al\s+escuchar\s+el\s+tono/i, /buz[oÃ³]n\s+de\s+voz/i,
+  /please\s+leave\s+your\s+message/i, /not\s+available.*leave.*message/i
+];
 
-// -------------------- Circuit Breaker --------------------
-class CircuitBreaker {
-  constructor(name) {
-    this.name = name;
-    this.state = "CLOSED"; // CLOSED|OPEN|HALF_OPEN
-    this.failures = 0;
-    this.nextAttemptAt = 0;
+// Goodbye detection patterns
+const GOODBYE_PATTERNS = [
+  /you're welcome/i, /de nada/i,
+  /have a (great|good|wonderful|nice) day/i, /que tengas? (un )?buen dÃ­a/i,
+  /take care/i, /cuÃ­date/i,
+  /goodbye/i, /adiÃ³s/i, /hasta luego/i,
+  /if you need anything else/i, /si necesitas? algo mÃ¡s/i,
+  /thanks for calling/i, /gracias por llamar/i,
+  /bye/i, /chao/i
+];
+
+// Spam phone number patterns
+const SPAM_PATTERNS = [
+  /^1800/, /^1888/, /^1877/, /^1866/, /^1855/
+];
+
+// Tools that should never be deduplicated
+const NEVER_DEDUP_TOOLS = [
+  "send_message", "send_email", "send_sms", "send_sms_reminder",
+  "schedule_appointment", "transfer_to_human", "end_call",
+  "create_lead", "create_or_merge_contact", "take_note"
+];
+
+
+// ============================================================
+// SECTION 2: UTILITIES
+// ============================================================
+
+/**
+ * Logger - Structured logging with levels and context
+ */
+class Logger {
+  constructor() {
+    this.levels = { DEBUG: 0, INFO: 1, WARN: 2, ERROR: 3, FATAL: 4 };
+    this.currentLevel = this.levels[process.env.LOG_LEVEL || "INFO"];
   }
-  canRun() {
-    if (this.state === "OPEN") {
-      if (Date.now() >= this.nextAttemptAt) {
-        this.state = "HALF_OPEN";
-        info("circuit_half_open", { circuit: this.name });
-        return true;
-      }
-      return false;
+
+  _log(level, message, context = {}) {
+    if (this.levels[level] < this.currentLevel) return;
+    const logEntry = {
+      timestamp: new Date().toISOString(),
+      level,
+      version: VERSION,
+      message,
+      ...context
+    };
+    const output = JSON.stringify(logEntry);
+    if (level === "ERROR" || level === "FATAL") {
+      console.error(output);
+    } else {
+      console.log(output);
     }
-    return true;
   }
-  onSuccess() {
-    if (this.state !== "CLOSED") info("circuit_closed", { circuit: this.name });
+
+  debug(message, context) { this._log("DEBUG", message, context); }
+  info(message, context) { this._log("INFO", message, context); }
+  warn(message, context) { this._log("WARN", message, context); }
+  error(message, context) { this._log("ERROR", message, context); }
+  fatal(message, context) { this._log("FATAL", message, context); }
+}
+
+const logger = new Logger();
+
+/**
+ * Validator - Input validation utilities
+ */
+class Validator {
+  static isValidUUID(str) {
+    if (!str || str === "undefined" || str === "null") return false;
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str);
+  }
+
+  static isValidPhone(phone) {
+    if (!phone) return false;
+    const normalized = String(phone).replace(/[^\d+]/g, "");
+    return normalized.length >= 10 && normalized.length <= 15;
+  }
+
+  static isValidEmail(email) {
+    if (!email) return false;
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+  }
+
+  static isValidLanguage(lang) {
+    return lang && SUPPORTED_LANGUAGES.hasOwnProperty(lang);
+  }
+
+  static isValidVoice(voice) {
+    return voice && VALID_OPENAI_VOICES.includes(voice.toLowerCase());
+  }
+
+  static sanitizeString(str, maxLength = 1000) {
+    if (!str) return "";
+    return String(str).substring(0, maxLength).trim();
+  }
+}
+
+/**
+ * Parser - Data parsing utilities
+ */
+class Parser {
+  static safeJsonParse(str, fallback = null) {
+    try {
+      return JSON.parse(str);
+    } catch {
+      return fallback;
+    }
+  }
+
+  static normalizePhone(phone) {
+    if (!phone) return "";
+    return String(phone).replace(/[^\d+]/g, "");
+  }
+
+  static decodeBase64Utf8(b64) {
+    if (!b64 || typeof b64 !== "string") return null;
+    try {
+      if (!/^[A-Za-z0-9+/=]+$/.test(b64)) return b64;
+      const binary = atob(b64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      const decoded = new TextDecoder("utf-8").decode(bytes);
+      if (decoded.includes("\uFFFD") || /[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(decoded)) {
+        return b64;
+      }
+      if (decoded && decoded.length > 0) {
+        logger.debug("Base64 decoded", { preview: decoded.substring(0, 80) });
+        return decoded;
+      }
+    } catch (e) {
+      logger.debug("Base64 decode failed", { error: e.message });
+      return b64;
+    }
+    return null;
+  }
+
+  static normalizeUnicode(str) {
+    if (!str) return str;
+    const ranges = [
+      { start: 0x1D400, end: 0x1D419, offset: 0x1D400 - 0x41 },
+      { start: 0x1D41A, end: 0x1D433, offset: 0x1D41A - 0x61 },
+      { start: 0x1D434, end: 0x1D44D, offset: 0x1D434 - 0x41 },
+      { start: 0x1D44E, end: 0x1D467, offset: 0x1D44E - 0x61 },
+      { start: 0x1D468, end: 0x1D481, offset: 0x1D468 - 0x41 },
+      { start: 0x1D482, end: 0x1D49B, offset: 0x1D482 - 0x61 },
+      { start: 0x1D49C, end: 0x1D4B5, offset: 0x1D49C - 0x41 },
+      { start: 0x1D4B6, end: 0x1D4CF, offset: 0x1D4B6 - 0x61 },
+      { start: 0x1D4D0, end: 0x1D4E9, offset: 0x1D4D0 - 0x41 },
+      { start: 0x1D4EA, end: 0x1D503, offset: 0x1D4EA - 0x61 },
+      { start: 0x1D5A0, end: 0x1D5B9, offset: 0x1D5A0 - 0x41 },
+      { start: 0x1D5BA, end: 0x1D5D3, offset: 0x1D5BA - 0x61 },
+      { start: 0x1D5D4, end: 0x1D5ED, offset: 0x1D5D4 - 0x41 },
+      { start: 0x1D5EE, end: 0x1D607, offset: 0x1D5EE - 0x61 },
+      { start: 0x1D670, end: 0x1D689, offset: 0x1D670 - 0x41 },
+      { start: 0x1D68A, end: 0x1D6A3, offset: 0x1D68A - 0x61 }
+    ];
+    let normalized = "";
+    for (const char of str) {
+      const code = char.codePointAt(0);
+      let found = false;
+      for (const range of ranges) {
+        if (code >= range.start && code <= range.end) {
+          normalized += String.fromCharCode(code - range.offset);
+          found = true;
+          break;
+        }
+      }
+      if (!found) normalized += char;
+    }
+    return normalized;
+  }
+}
+
+/**
+ * Utility functions
+ */
+function requireEnv(name, value) {
+  if (!value) {
+    logger.fatal("Missing required environment variable", { variable: name });
+    throw new Error(`Missing required env: ${name}`);
+  }
+  return value;
+}
+
+function generatePrepId() {
+  return `prep_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+}
+
+function generateSessionId() {
+  return `session_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+}
+
+// Validate required environment variables
+requireEnv("SUPABASE_URL", SUPABASE_URL);
+requireEnv("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_KEY);
+requireEnv("OPENAI_API_KEY", OPENAI_API_KEY);
+
+if (!VOICE_GATEWAY_TOKEN) {
+  logger.warn("VOICE_GATEWAY_TOKEN not set â€” prewarm/sessions endpoints will be unprotected");
+}
+
+logger.info("Voice Gateway starting", {
+  version: VERSION,
+  port: PORT,
+  webhooksEnabled: ENABLE_WEBHOOKS,
+  metricsEnabled: ENABLE_METRICS
+});
+
+
+// ============================================================
+// SECTION 3: RESILIENCE
+// ============================================================
+
+/**
+ * RetryManager - Exponential backoff with jitter
+ */
+class RetryManager {
+  static async execute(fn, options = {}) {
+    const {
+      maxRetries = MAX_RETRIES,
+      baseDelay = BASE_RETRY_DELAY_MS,
+      maxDelay = MAX_RETRY_DELAY_MS,
+      retryableErrors = [500, 502, 503, 504, 429],
+      context = {}
+    } = options;
+
+    let lastError;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const result = await fn();
+        if (attempt > 0) {
+          logger.info("Retry succeeded", { ...context, attempt, maxRetries });
+        }
+        return result;
+      } catch (error) {
+        lastError = error;
+        const isRetryable = this._isRetryable(error, retryableErrors);
+        if (!isRetryable || attempt === maxRetries) {
+          if (attempt > 0) {
+            logger.error("Operation failed after retries", { ...context, attempt, error: error.message });
+          }
+          throw error;
+        }
+        const delay = Math.min(
+          baseDelay * Math.pow(2, attempt) + Math.random() * 100,
+          maxDelay
+        );
+        logger.warn("Retry scheduled", { ...context, attempt: attempt + 1, delayMs: Math.round(delay) });
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+    throw lastError;
+  }
+
+  static _isRetryable(error, retryableErrors) {
+    if (error.status && retryableErrors.includes(error.status)) return true;
+    if (["ECONNRESET", "ETIMEDOUT", "ECONNREFUSED"].includes(error.code)) return true;
+    return false;
+  }
+}
+
+/**
+ * CircuitBreaker - Protect against cascading failures
+ */
+class CircuitBreaker {
+  constructor(name, options = {}) {
+    this.name = name;
+    this.failureThreshold = options.failureThreshold || CIRCUIT_BREAKER_FAILURE_THRESHOLD;
+    this.resetTimeout = options.resetTimeout || CIRCUIT_BREAKER_RESET_TIMEOUT_MS;
     this.state = "CLOSED";
     this.failures = 0;
-    this.nextAttemptAt = 0;
+    this.nextAttempt = Date.now();
+    this.successCount = 0;
   }
-  onFailure() {
-    this.failures += 1;
-    warn("circuit_failure", { circuit: this.name, failures: this.failures, threshold: CIRCUIT_FAILURE_THRESHOLD });
-    if (this.failures >= CIRCUIT_FAILURE_THRESHOLD) {
-      this.state = "OPEN";
-      this.nextAttemptAt = Date.now() + CIRCUIT_RESET_MS;
-      error("circuit_opened", { circuit: this.name, reset_ms: CIRCUIT_RESET_MS });
-    }
-  }
+
   async execute(fn) {
-    if (!this.canRun()) throw new Error(`Circuit ${this.name} is OPEN`);
+    if (this.state === "OPEN") {
+      if (Date.now() < this.nextAttempt) {
+        const error = new Error(`Circuit breaker [${this.name}] is OPEN`);
+        error.circuitOpen = true;
+        throw error;
+      }
+      this.state = "HALF_OPEN";
+      this.successCount = 0;
+      logger.info("Circuit breaker attempting to close", { service: this.name, state: "HALF_OPEN" });
+    }
+
     try {
-      const out = await fn();
+      const result = await fn();
       this.onSuccess();
-      return out;
-    } catch (e) {
+      return result;
+    } catch (error) {
       this.onFailure();
-      throw e;
+      throw error;
     }
+  }
+
+  onSuccess() {
+    this.failures = 0;
+    if (this.state === "HALF_OPEN") {
+      this.successCount++;
+      if (this.successCount >= 2) {
+        this.state = "CLOSED";
+        logger.info("Circuit breaker closed", { service: this.name });
+      }
+    }
+  }
+
+  onFailure() {
+    this.failures++;
+    logger.warn("Circuit breaker failure recorded", {
+      service: this.name, failures: this.failures, threshold: this.failureThreshold
+    });
+    if (this.failures >= this.failureThreshold) {
+      this.state = "OPEN";
+      this.nextAttempt = Date.now() + this.resetTimeout;
+      logger.error("Circuit breaker opened", { service: this.name, resetInMs: this.resetTimeout });
+    }
+  }
+
+  getState() {
+    return { name: this.name, state: this.state, failures: this.failures, threshold: this.failureThreshold };
   }
 }
 
-// -------------------- Retry helper (backoff) --------------------
-async function withRetry(fn, opts = {}) {
-  const max = opts.max ?? TOOL_RETRY_MAX;
-  const base = opts.baseMs ?? 120;
-  const cap = opts.capMs ?? 1800;
+// Initialize circuit breakers
+const supabaseCircuit = new CircuitBreaker("Supabase", { failureThreshold: 3, resetTimeout: 30000 });
+const openaiCircuit = new CircuitBreaker("OpenAI", { failureThreshold: 5, resetTimeout: 60000 });
+const crmToolsCircuit = new CircuitBreaker("CRM_Tools", { failureThreshold: 5, resetTimeout: 60000 });
 
-  let lastErr;
-  for (let attempt = 0; attempt <= max; attempt++) {
-    try { return await fn(attempt); }
-    catch (e) {
-      lastErr = e;
-      const isLast = attempt === max;
-      if (isLast) break;
-      const delay = Math.min(base * Math.pow(2, attempt) + Math.random() * 120, cap);
-      warn("retrying", { attempt: attempt + 1, max, delay_ms: delay, err: e.message });
-      await sleep(delay);
+/**
+ * RateLimiter - Rate limiting per tenant and per IP
+ */
+class RateLimiter {
+  static checkTenantLimit(companyId) {
+    if (!companyId) return { allowed: false, reason: "No company ID" };
+
+    const now = Date.now();
+    if (!tenantCallCounts.has(companyId)) {
+      tenantCallCounts.set(companyId, { concurrent: 0, hourly: [] });
+    }
+    const counts = tenantCallCounts.get(companyId);
+
+    if (counts.concurrent >= RATE_LIMIT_CALLS_PER_TENANT_CONCURRENT) {
+      return { allowed: false, reason: "Concurrent call limit exceeded", limit: RATE_LIMIT_CALLS_PER_TENANT_CONCURRENT };
+    }
+
+    counts.hourly = counts.hourly.filter(t => now - t < 3600000);
+    if (counts.hourly.length >= RATE_LIMIT_CALLS_PER_TENANT_HOUR) {
+      return { allowed: false, reason: "Hourly call limit exceeded", limit: RATE_LIMIT_CALLS_PER_TENANT_HOUR };
+    }
+
+    return { allowed: true };
+  }
+
+  static incrementTenantCalls(companyId) {
+    if (!companyId) return;
+    if (!tenantCallCounts.has(companyId)) {
+      tenantCallCounts.set(companyId, { concurrent: 0, hourly: [] });
+    }
+    const counts = tenantCallCounts.get(companyId);
+    counts.concurrent++;
+    counts.hourly.push(Date.now());
+  }
+
+  static decrementTenantCalls(companyId) {
+    if (!companyId) return;
+    if (tenantCallCounts.has(companyId)) {
+      const counts = tenantCallCounts.get(companyId);
+      counts.concurrent = Math.max(0, counts.concurrent - 1);
     }
   }
-  throw lastErr;
+
+  static checkIPLimit(ip) {
+    if (!ip) return { allowed: true };
+    const now = Date.now();
+    if (!ipRequestCounts.has(ip)) {
+      ipRequestCounts.set(ip, []);
+    }
+    const recentRequests = ipRequestCounts.get(ip).filter(t => now - t < 60000);
+    ipRequestCounts.set(ip, recentRequests);
+    if (recentRequests.length >= RATE_LIMIT_REQUESTS_PER_IP_MINUTE) {
+      return { allowed: false, reason: "IP rate limit exceeded", limit: RATE_LIMIT_REQUESTS_PER_IP_MINUTE };
+    }
+    recentRequests.push(now);
+    return { allowed: true };
+  }
 }
 
-// -------------------- Language detection (EN/ES) --------------------
-const EN_HINTS = ["thank", "please", "yes", "no", "help", "appointment", "schedule", "tax", "today", "tomorrow", "morning", "afternoon"];
-const ES_HINTS = ["gracias", "por favor", "sí", "no", "cita", "agendar", "impuestos", "hoy", "mañana", "buenos", "tardes"];
-function detectLang(text) {
-  const t = (text || "").toLowerCase();
-  if (!t.trim()) return null;
-  let en = 0, es = 0;
-  for (const w of EN_HINTS) if (t.includes(w)) en++;
-  for (const w of ES_HINTS) if (t.includes(w)) es++;
-  if (en === 0 && es === 0) return null;
-  if (en > es) return "en";
-  if (es > en) return "es";
+
+// ============================================================
+// SECTION 4: STATE MANAGEMENT
+// ============================================================
+
+/**
+ * SessionManager - Manage session lifecycle
+ */
+class SessionManager {
+  static createSession(config = {}) {
+    const sessionId = config.sessionId || generateSessionId();
+
+    const session = {
+      // Identifiers
+      sessionId,
+      callSid: config.callSid || null,
+      prepId: config.prepId || null,
+
+      // Configuration
+      companyId: config.companyId,
+      agentId: config.agentId,
+      config: config.agentConfig || null,
+
+      // Call state
+      direction: config.direction || "inbound",
+      fromNumber: config.fromNumber || "",
+      toNumber: config.toNumber || "",
+      customerPhone: config.customerPhone || "",
+      language: config.language || DEFAULT_LANGUAGE,
+
+      // Connections
+      twilioWs: null,
+      openaiWs: null,
+      streamSid: null,
+
+      // Conversational state
+      transcripts: { user: [], assistant: [] },
+      toolCalls: [],
+      preloadedContact: config.preloadedContact || null,
+      dynamicInstructions: config.dynamicInstructions || null,
+      dynamicInstructionsMode: config.dynamicInstructionsMode || "addon",
+      dynamicFirstMessage: config.dynamicFirstMessage || null,
+
+      // Flags
+      sessionCreated: false,
+      sessionReady: false,
+      twilioStreamReady: false,
+      callEnding: false,
+      greetingMessageSent: false,
+      greetingTriggered: false,
+      voicemailHandled: false,
+      firstAudioSent: false,
+      skipGreeting: config.skipGreeting || false,
+      isDemoCall: config.isDemoCall || false,
+      configReady: false,
+      pendingSessionUpdate: false,
+
+      // Response locking
+      responseLock: { isLocked: false, lockedBy: null, lockedAt: null },
+
+      // Timers
+      autoHangupTimer: null,
+      greetingTimer: null,
+      ringbackInterval: null,
+      ringbackFrames: 0,
+
+      // Metrics
+      metrics: {
+        t_session_created: Date.now(),
+        t_openai_connected: null,
+        t_config_loaded: null,
+        t_session_ready: null,
+        t_stream_start: null,
+        t_first_audio_sent: null,
+        t_call_ended: null
+      },
+
+      // Metadata
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    };
+
+    sessions.set(sessionId, session);
+
+    logger.info("Session created", {
+      sessionId, callSid: session.callSid,
+      companyId: session.companyId, direction: session.direction
+    });
+
+    return session;
+  }
+
+  static getSession(sessionId) {
+    return sessions.get(sessionId);
+  }
+
+  static getSessionByCallSid(callSid) {
+    for (const [, session] of sessions.entries()) {
+      if (session.callSid === callSid) return session;
+    }
+    return null;
+  }
+
+  static deleteSession(sessionId) {
+    const session = sessions.get(sessionId);
+    if (session) {
+      if (session.autoHangupTimer) clearTimeout(session.autoHangupTimer);
+      if (session.greetingTimer) clearTimeout(session.greetingTimer);
+      if (session.ringbackInterval) clearInterval(session.ringbackInterval);
+      if (session.companyId) {
+        RateLimiter.decrementTenantCalls(session.companyId);
+      }
+      sessions.delete(sessionId);
+      logger.info("Session deleted", {
+        sessionId, callSid: session.callSid,
+        durationMs: Date.now() - session.createdAt
+      });
+    }
+  }
+
+  static getActiveSessionCount() {
+    return sessions.size;
+  }
+
+  static getPrewarmSessionCount() {
+    return prewarmSessions.size;
+  }
+}
+
+/**
+ * ResponseLockManager - Prevent concurrent OpenAI responses
+ */
+class ResponseLockManager {
+  static init(session) {
+    session.responseLock = { isLocked: false, lockedBy: null, lockedAt: null };
+  }
+
+  static tryLock(session, reason) {
+    if (!session.responseLock) this.init(session);
+    if (session.responseLock.isLocked) return false;
+    session.responseLock = { isLocked: true, lockedBy: reason, lockedAt: Date.now() };
+    return true;
+  }
+
+  static unlock(session, reason) {
+    if (session.responseLock?.isLocked) {
+      const dur = Date.now() - (session.responseLock.lockedAt || Date.now());
+      logger.debug("Response unlocked", { reason, durationMs: dur });
+    }
+    if (session.responseLock) {
+      session.responseLock.isLocked = false;
+      session.responseLock.lockedBy = null;
+    }
+  }
+
+  static sendResponseCreateSafe(session, payload, reason) {
+    if (session.callEnding) return false;
+    if (!this.tryLock(session, "response.create:" + reason)) return false;
+    if (session.openaiWs?.readyState === WebSocket.OPEN) {
+      session.openaiWs.send(JSON.stringify(payload));
+      return true;
+    }
+    return false;
+  }
+}
+
+/**
+ * Prewarm session management
+ */
+function createPrewarmSession(agentId, companyId, config) {
+  const prepId = generatePrepId();
+  const prewarmData = {
+    prepId, agentId, companyId, config,
+    openaiWs: null,
+    sessionCreated: false,
+    sessionReady: false,
+    createdAt: Date.now(),
+    expiresAt: Date.now() + PREWARM_SESSION_TTL_MS
+  };
+  prewarmSessions.set(prepId, prewarmData);
+  logger.info("Prewarm session created", { prepId, agentId, companyId });
+  return prewarmData;
+}
+
+function getPrewarmSession(agentId, companyId) {
+  const now = Date.now();
+  for (const [prepId, prewarm] of prewarmSessions.entries()) {
+    if (prewarm.agentId === agentId &&
+      prewarm.companyId === companyId &&
+      prewarm.sessionReady &&
+      prewarm.expiresAt > now) {
+      prewarmSessions.delete(prepId);
+      logger.info("Prewarm session reused", { prepId, agentId, ageMs: now - prewarm.createdAt });
+      return prewarm;
+    }
+  }
   return null;
 }
 
-// -------------------- Prompts + Guardrails --------------------
-const BASE_PROMPT = `
-You are a professional, friendly voice assistant.
-Rules:
-- Be concise, natural, and helpful.
-- Ask one question at a time.
-- Confirm critical details (name, phone, date/time).
-- Use tools when appropriate.
-- If a tool fails, apologize briefly and offer an alternative (take note / schedule later / transfer).
-`.trim();
-
-function buildSystemPrompt(session) {
-  // Precedence (learned): base rules + company + campaign + dynamic
-  const ops = `
-Operational:
-- Language policy:
-  - auto_detect=${ENABLE_AUTO_DETECT_LANGUAGE}
-  - default=${DEFAULT_LANGUAGE}
-  - current=${session.language}
-  - lock=${session.languageLocked}
-- You MUST speak in ${session.language === "es" ? "Spanish" : "English"} unless told otherwise by system.
-- If you detect user speaking the other language and auto_detect enabled, request permission to switch and then switch.
-- If language is locked, DO NOT switch languages.
-- Keep compliance and safety. No sensitive data collection beyond what's needed.
-`.trim();
-
-  const company = session.companyPrompt || "";
-  const campaign = session.campaignScript || "";
-  const dynamic = session.dynamicInstructions || "";
-
-  return [BASE_PROMPT, ops, company, campaign, dynamic].filter(Boolean).join("\n\n").trim();
-}
-
-// -------------------- Sessions --------------------
-const sessions = new Map(); // callSid/prewarmId -> session
-function createSession(id) {
-  return {
-    id,
-    callSid: null,
-    streamSid: null,
-    createdAt: Date.now(),
-    direction: "inbound",
-    fromNumber: null,
-    toNumber: null,
-
-    // language
-    language: (DEFAULT_LANGUAGE === "en" || DEFAULT_LANGUAGE === "es") ? DEFAULT_LANGUAGE : "en",
-    languageLocked: false,
-    userTurns: 0,
-
-    // prompts
-    companyId: "sandbox",
-    companyPrompt: "",
-    campaignScript: "",
-    dynamicInstructions: "",
-
-    // transcripts
-    transcripts: { user: [], assistant: [] },
-
-    // tools
-    toolHistory: new Map(), // dedupKey -> lastMs
-    toolCallsInProgress: 0,
-
-    // openai state
-    speaking: false
-  };
-}
-function getSession(id) {
-  if (!sessions.has(id)) sessions.set(id, createSession(id));
-  return sessions.get(id);
-}
-
-// -------------------- Tooling (Sandbox-first) --------------------
-const circuitTools = new CircuitBreaker("tools");
-const circuitSupabase = new CircuitBreaker("supabase");
-const circuitTwilio = new CircuitBreaker("twilio");
-
-// Tool registry: implement MANY tools (mock default)
-const toolRegistry = {
-  // Core CRM/ops tools
-  lookup_contact: async (args, ctx) => mockOk("lookup_contact", args, ctx),
-  create_lead: async (args, ctx) => mockOk("create_lead", args, ctx),
-  update_contact: async (args, ctx) => mockOk("update_contact", args, ctx),
-  take_note: async (args, ctx) => mockOk("take_note", args, ctx),
-
-  // Messaging
-  send_sms: async (args, ctx) => mockOk("send_sms", args, ctx),
-  send_email: async (args, ctx) => mockOk("send_email", args, ctx),
-  send_whatsapp: async (args, ctx) => mockOk("send_whatsapp", args, ctx),
-
-  // Scheduling
-  schedule_appointment: async (args, ctx) => mockOk("schedule_appointment", args, ctx),
-  reschedule_appointment: async (args, ctx) => mockOk("reschedule_appointment", args, ctx),
-  cancel_appointment: async (args, ctx) => mockOk("cancel_appointment", args, ctx),
-
-  // Call control
-  transfer_to_human: async (args, ctx) => transferToHuman(args, ctx),
-  end_call: async (args, ctx) => endCall(args, ctx),
-
-  // Extras (add as needed)
-  set_language: async (args, ctx) => setLanguage(args, ctx),
-  set_followup: async (args, ctx) => mockOk("set_followup", args, ctx)
-};
-
-function mockOk(name, args, ctx) {
-  // Mock tools: no external calls. Safe for testing.
-  info("tool_mock", { tool: name, callSid: ctx.callSid, args });
-  return {
-    ok: true,
-    tool: name,
-    mode: "mock",
-    message: "Mock tool executed (no external connector).",
-    echo: args || {}
-  };
-}
-
-function toolDedupKey(name, args) {
-  return `${name}:${sha1(JSON.stringify(args || {}))}`;
-}
-
-async function runTool(name, args, ctx) {
-  if (!toolRegistry[name]) throw new Error(`Unknown tool: ${name}`);
-
-  // Dedup (context-aware)
-  if (ENABLE_DEDUP) {
-    const k = toolDedupKey(name, args);
-    const last = ctx.session.toolHistory.get(k);
-    const now = Date.now();
-    if (last && now - last < DEDUP_WINDOW_MS) {
-      warn("tool_dedup_blocked", { tool: name, window_ms: DEDUP_WINDOW_MS, callSid: ctx.callSid });
-      return { ok: true, deduped: true, tool: name, message: "Duplicate tool call suppressed." };
-    }
-    ctx.session.toolHistory.set(k, now);
-  }
-
-  ctx.session.toolCallsInProgress += 1;
-  const started = Date.now();
-
-  try {
-    const res = await circuitTools.execute(() =>
-      withRetry(async () => {
-        const p = toolRegistry[name](args || {}, ctx);
-        return await withTimeout(Promise.resolve(p), TOOL_TIMEOUT_MS, "tool_timeout");
-      })
-    );
-
-    info("tool_ok", { tool: name, ms: Date.now() - started, callSid: ctx.callSid });
-    return res;
-  } finally {
-    ctx.session.toolCallsInProgress = Math.max(0, ctx.session.toolCallsInProgress - 1);
-  }
-}
-
-// -------------------- Twilio call control tools --------------------
-function requireTwilio() {
-  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) throw new Error("Missing TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN");
-  return twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
-}
-
-async function transferToHuman(args, ctx) {
-  // args: { phone, whisper_message? }
-  const phone = args.phone;
-  if (!phone) return { ok: false, error: "transfer_to_human requires phone" };
-  if (!ctx.callSid) return { ok: false, error: "No callSid available for transfer" };
-
-  // Transfer on Twilio by updating call with TwiML <Dial>
-  // NOTE: Media Streams transfer can be tricky; this does a hard redirect to Dial.
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Dial>${xmlEscape(phone)}</Dial>
-</Response>`;
-
-  try {
-    const client = requireTwilio();
-    await circuitTwilio.execute(async () => {
-      await client.calls(ctx.callSid).update({ twiml });
-    });
-    info("transfer_requested", { callSid: ctx.callSid, to: phone });
-    return { ok: true, transferred: true, to: phone };
-  } catch (e) {
-    error("transfer_failed", { callSid: ctx.callSid, err: e.message });
-    return { ok: false, error: e.message, fallback: "Offer to take a message instead." };
-  }
-}
-
-async function endCall(args, ctx) {
-  if (!ctx.callSid) return { ok: false, error: "No callSid available to end call" };
-  try {
-    const client = requireTwilio();
-    await circuitTwilio.execute(async () => {
-      await client.calls(ctx.callSid).update({ status: "completed" });
-    });
-    info("call_ended", { callSid: ctx.callSid });
-    return { ok: true, ended: true };
-  } catch (e) {
-    error("end_call_failed", { callSid: ctx.callSid, err: e.message });
-    return { ok: false, error: e.message };
-  }
-}
-
-function setLanguage(args, ctx) {
-  const lang = String(args.language || "").toLowerCase();
-  if (lang !== "en" && lang !== "es") return { ok: false, error: "language must be en or es" };
-  ctx.session.language = lang;
-  ctx.session.languageLocked = true;
-  info("language_set_locked", { callSid: ctx.callSid, language: lang });
-  return { ok: true, language: lang, locked: true };
-}
-
-// -------------------- Supabase optional (SAFE) --------------------
-async function supabaseRest(path, method, body) {
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) throw new Error("Supabase ENV missing");
-  const url = `${SUPABASE_URL}/rest/v1/${path}`;
-  const res = await fetch(url, {
-    method,
-    headers: {
-      "apikey": SUPABASE_SERVICE_ROLE_KEY,
-      "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-      "Prefer": "return=representation"
-    },
-    body: body ? JSON.stringify(body) : undefined
-  });
-  const text = await res.text();
-  const json = safeJsonParse(text);
-  if (!res.ok) {
-    const err = new Error(`Supabase ${method} ${path} failed (${res.status})`);
-    err.details = { status: res.status, text: text.slice(0, 800) };
-    throw err;
-  }
-  return json ?? { raw: text };
-}
-
-async function safeDbLogCall(session) {
-  // MUST NEVER BREAK CALL if schema mismatches
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return;
-
-  const payload = {
-    call_sid: session.callSid,
-    company_id: session.companyId,
-    direction: session.direction,
-    from_number: session.fromNumber,
-    to_number: session.toNumber,
-    status: "in_progress",
-    started_at: new Date().toISOString()
-  };
-
-  try {
-    await circuitSupabase.execute(async () => {
-      await withTimeout(
-        withRetry(() => supabaseRest(`${SUPABASE_CALLS_TABLE}`, "POST", payload), { max: 1 }),
-        5000,
-        "db_timeout"
-      );
-    });
-    info("db_call_logged", { callSid: session.callSid });
-  } catch (e) {
-    // This is exactly where v4.60.x failed; we log but never crash
-    warn("db_call_log_failed_non_blocking", { callSid: session.callSid, err: e.message, details: e.details || null });
-  }
-}
-
-async function safeDbSyncTranscripts(session) {
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return;
-
-  const combined = [];
-  const maxLen = Math.max(session.transcripts.user.length, session.transcripts.assistant.length);
-  for (let i = 0; i < maxLen; i++) {
-    if (i < session.transcripts.user.length) combined.push({ role: "user", content: session.transcripts.user[i] });
-    if (i < session.transcripts.assistant.length) combined.push({ role: "assistant", content: session.transcripts.assistant[i] });
-  }
-  if (combined.length === 0) {
-    info("db_transcript_skip_empty", { callSid: session.callSid });
-    return;
-  }
-
-  try {
-    await circuitSupabase.execute(async () => {
-      await withTimeout(
-        withRetry(() => supabaseRest(`${SUPABASE_TRANSCRIPTS_TABLE}`, "POST", {
-          call_sid: session.callSid,
-          transcripts: combined,
-          created_at: new Date().toISOString()
-        }), { max: 1 }),
-        7000,
-        "db_timeout"
-      );
-    });
-    info("db_transcripts_synced", { callSid: session.callSid, count: combined.length });
-  } catch (e) {
-    warn("db_transcripts_failed_non_blocking", { callSid: session.callSid, err: e.message, details: e.details || null });
-  }
-}
-
-// -------------------- OpenAI Realtime connector --------------------
-function connectOpenAI(session) {
-  if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
-  const url = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`;
-
-  const ws = new WebSocket(url, {
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "OpenAI-Beta": "realtime=v1"
-    }
-  });
-
-  ws.on("open", () => {
-    info("openai_connected", { callSid: session.callSid || session.id });
-
-    const prompt = buildSystemPrompt(session);
-
-    ws.send(JSON.stringify({
-      type: "session.update",
-      session: {
-        instructions: prompt,
-        input_audio_format: "g711_ulaw",
-        output_audio_format: "g711_ulaw",
-        voice: "alloy",
-        tools: OPENAI_TOOL_SCHEMAS,
-        tool_choice: "auto"
+function cleanupExpiredPrewarmSessions() {
+  const now = Date.now();
+  let cleaned = 0;
+  for (const [prepId, prewarm] of prewarmSessions.entries()) {
+    if (prewarm.expiresAt <= now) {
+      if (prewarm.openaiWs) {
+        prewarm.openaiWs.close(1000, "prewarm_expired");
       }
-    }));
-  });
-
-  ws.on("error", (e) => warn("openai_error", { callSid: session.callSid || session.id, err: e.message }));
-  ws.on("close", (code, reason) => info("openai_closed", { callSid: session.callSid || session.id, code, reason: String(reason || "") }));
-
-  return ws;
-}
-
-// Tools schemas exposed to OpenAI (many tools)
-const OPENAI_TOOL_SCHEMAS = [
-  { type: "function", name: "lookup_contact", description: "Lookup contact by name/phone/email in CRM.", parameters: { type: "object", properties: { phone:{type:"string"}, email:{type:"string"}, name:{type:"string"} }, required: [] } },
-  { type: "function", name: "create_lead", description: "Create a new lead in CRM.", parameters: { type: "object", properties: { name:{type:"string"}, phone:{type:"string"}, email:{type:"string"}, notes:{type:"string"} }, required: [] } },
-  { type: "function", name: "update_contact", description: "Update contact fields in CRM.", parameters: { type: "object", properties: { phone:{type:"string"}, fields:{type:"object"} }, required: ["fields"] } },
-  { type: "function", name: "take_note", description: "Save a note for follow-up.", parameters: { type: "object", properties: { note:{type:"string"} }, required: ["note"] } },
-
-  { type: "function", name: "send_sms", description: "Send SMS message.", parameters: { type: "object", properties: { phone:{type:"string"}, message:{type:"string"} }, required: ["phone","message"] } },
-  { type: "function", name: "send_email", description: "Send email message.", parameters: { type: "object", properties: { email:{type:"string"}, subject:{type:"string"}, body:{type:"string"} }, required: ["email","subject","body"] } },
-  { type: "function", name: "send_whatsapp", description: "Send WhatsApp message.", parameters: { type: "object", properties: { phone:{type:"string"}, message:{type:"string"} }, required: ["phone","message"] } },
-
-  { type: "function", name: "schedule_appointment", description: "Schedule appointment.", parameters: { type: "object", properties: { phone:{type:"string"}, datetime_iso:{type:"string"}, notes:{type:"string"} }, required: ["datetime_iso"] } },
-  { type: "function", name: "reschedule_appointment", description: "Reschedule appointment.", parameters: { type: "object", properties: { appointment_id:{type:"string"}, datetime_iso:{type:"string"} }, required: ["appointment_id","datetime_iso"] } },
-  { type: "function", name: "cancel_appointment", description: "Cancel appointment.", parameters: { type: "object", properties: { appointment_id:{type:"string"}, reason:{type:"string"} }, required: ["appointment_id"] } },
-
-  { type: "function", name: "transfer_to_human", description: "Transfer call to a human agent phone number.", parameters: { type: "object", properties: { phone:{type:"string"} }, required: ["phone"] } },
-  { type: "function", name: "end_call", description: "End/hang up the call.", parameters: { type: "object", properties: { reason:{type:"string"} }, required: [] } },
-
-  { type: "function", name: "set_language", description: "Set language and lock it.", parameters: { type: "object", properties: { language:{type:"string", enum:["en","es"]} }, required: ["language"] } },
-  { type: "function", name: "set_followup", description: "Set follow-up reminder/task.", parameters: { type: "object", properties: { when_iso:{type:"string"}, note:{type:"string"} }, required: ["when_iso","note"] } }
-];
-
-// -------------------- Barge-in --------------------
-function interruptIfSpeaking(session, openaiWs) {
-  if (session.speaking && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
-    session.speaking = false;
-    openaiWs.send(JSON.stringify({ type: "response.cancel" }));
-    info("barge_in_cancel", { callSid: session.callSid });
+      prewarmSessions.delete(prepId);
+      cleaned++;
+    }
+  }
+  if (cleaned > 0) {
+    logger.info("Prewarm sessions cleaned", { count: cleaned });
   }
 }
 
-// -------------------- WebSocket server (Twilio Stream) --------------------
-const wss = new WebSocketServer({ noServer: true });
+setInterval(cleanupExpiredPrewarmSessions, PREWARM_CLEANUP_INTERVAL_MS);
 
-wss.on("connection", (twilioWs) => {
-  let openaiWs = null;
-  let session = null;
 
-  twilioWs.on("message", async (buf) => {
-    const msg = safeJsonParse(buf.toString("utf8"));
-    if (!msg) return;
+// ============================================================
+// SECTION 5: EXTERNAL SERVICES
+// ============================================================
 
-    if (msg.event === "start") {
-      const callSid = msg.start?.callSid || uuidv4();
-      const streamSid = msg.start?.streamSid || null;
-
-      session = getSession(callSid);
-      session.callSid = callSid;
-      session.streamSid = streamSid;
-
-      const custom = msg.start?.customParameters || {};
-      session.direction = custom.direction || "inbound";
-      session.companyId = custom.company_id || "sandbox";
-      session.fromNumber = custom.from || null;
-      session.toNumber = custom.to || null;
-
-      // Language initial
-      const initLang = (custom.language || DEFAULT_LANGUAGE || "auto").toLowerCase();
-      if (initLang === "es" || initLang === "en") session.language = initLang;
-      if (initLang === "auto" && DEFAULT_LANGUAGE === "auto") session.language = "en"; // start EN, will auto-detect
-
-      session.dynamicInstructions = custom.dynamic_instructions || "";
-
-      info("twilio_start", { callSid, streamSid, companyId: session.companyId, direction: session.direction });
-
-      // Optional: DB log call (non-blocking)
-      safeDbLogCall(session);
-
-      // Connect OpenAI
-      try {
-        openaiWs = connectOpenAI(session);
-      } catch (e) {
-        error("openai_connect_failed", { callSid, err: e.message });
-      }
-
-      if (openaiWs) {
-        openaiWs.on("message", async (raw) => {
-          const evt = safeJsonParse(raw.toString("utf8"));
-          if (!evt) return;
-
-          // Assistant audio
-          if (evt.type === "response.audio.delta" && evt.delta) {
-            session.speaking = true;
-            if (twilioWs.readyState === WebSocket.OPEN) {
-              twilioWs.send(JSON.stringify({ event: "media", streamSid: session.streamSid, media: { payload: evt.delta } }));
-            }
-            return;
-          }
-          if (evt.type === "response.done") {
-            session.speaking = false;
-            return;
-          }
-
-          // Transcripts (if provided by model events)
-          if (evt.type === "response.output_text.delta" && evt.delta) {
-            // optional: accumulate, but realtime often emits audio only; keep for completeness
-            return;
-          }
-
-          // Tool calling
-          if (evt.type === "response.function_call_arguments.done") {
-            const toolName = evt.name;
-            const args = safeJsonParse(evt.arguments || "{}") || {};
-
-            info("tool_call", { callSid: session.callSid, tool: toolName });
-
-            try {
-              const out = await runTool(toolName, args, { callSid: session.callSid, session });
-              openaiWs.send(JSON.stringify({
-                type: "conversation.item.create",
-                item: {
-                  type: "function_call_output",
-                  call_id: evt.call_id,
-                  output: JSON.stringify(out)
-                }
-              }));
-              openaiWs.send(JSON.stringify({ type: "response.create" }));
-            } catch (e) {
-              warn("tool_call_failed", { callSid: session.callSid, tool: toolName, err: e.message });
-              openaiWs.send(JSON.stringify({
-                type: "conversation.item.create",
-                item: {
-                  type: "function_call_output",
-                  call_id: evt.call_id,
-                  output: JSON.stringify({ ok: false, error: e.message, details: e.details || null })
-                }
-              }));
-              openaiWs.send(JSON.stringify({ type: "response.create" }));
-            }
-            return;
-          }
-
-          if (evt.type === "error") {
-            warn("openai_evt_error", { callSid: session.callSid, evt });
-          }
-        });
-
-        openaiWs.on("close", async () => {
-          // Sync transcripts non-blocking
-          try { await safeDbSyncTranscripts(session); } catch {}
-        });
-      }
-
-      return;
-    }
-
-    if (msg.event === "media") {
-      if (!session || !openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
-
-      // Barge-in
-      interruptIfSpeaking(session, openaiWs);
-
-      // Feed user audio
-      const payload = msg.media?.payload;
-      if (payload) {
-        openaiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: payload }));
-      }
-      return;
-    }
-
-    if (msg.event === "stop") {
-      info("twilio_stop", { callSid: session?.callSid });
-      try { if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close(); } catch {}
-      return;
-    }
-  });
-
-  twilioWs.on("close", () => {
-    try { if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close(); } catch {}
-  });
-
-  twilioWs.on("error", (e) => warn("twilio_ws_error", { err: e.message }));
-});
-
-// -------------------- HTTP server --------------------
-const server = http.createServer(async (req, res) => {
-  // Basic routing
-  if (req.method === "GET" && req.url === "/") {
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(`
-      <html><body style="font-family:Arial;padding:24px">
-        <h2>${xmlEscape(VERSION)}</h2>
-        <p>Running ✅</p>
-        <ul>
-          <li><a href="/health">/health</a></li>
-          <li><a href="/ready">/ready</a></li>
-          <li><a href="/version">/version</a></li>
-        </ul>
-      </body></html>
-    `);
-    return;
-  }
-
-  if (req.method === "GET" && req.url === "/version") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ version: VERSION, env: NODE_ENV, mode: MODE }));
-    return;
-  }
-
-  if (req.method === "GET" && req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      ok: true,
-      version: VERSION,
-      time: new Date().toISOString()
-    }));
-    return;
-  }
-
-  // readiness includes env sanity checks
-  if (req.method === "GET" && req.url === "/ready") {
-    const checks = {
-      public_base_url: !!PUBLIC_BASE_URL,
-      openai_key: !!OPENAI_API_KEY,
-      twilio_sid: !!TWILIO_ACCOUNT_SID,
-      twilio_token: !!TWILIO_AUTH_TOKEN,
-      from_number: !!TWILIO_FROM_NUMBER
+/**
+ * SupabaseClient - Interact with Supabase REST API (with Circuit Breaker + Retry)
+ */
+class SupabaseClient {
+  static async request(endpoint, method = "GET", body = null, prefer = null) {
+    const url = `${SUPABASE_URL}/rest/v1/${endpoint}`;
+    const headers = {
+      "apikey": SUPABASE_SERVICE_KEY,
+      "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
+      "Content-Type": "application/json"
     };
-    const ok = Object.values(checks).every(Boolean);
-    res.writeHead(ok ? 200 : 503, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok, checks }));
-    return;
+    if (prefer) headers["Prefer"] = prefer;
+    const options = { method, headers };
+    if (body) options.body = JSON.stringify(body);
+    const context = { endpoint, method };
+
+    try {
+      const response = await supabaseCircuit.execute(async () => {
+        return await RetryManager.execute(
+          async () => {
+            const res = await fetch(url, options);
+            if (!res.ok) {
+              const error = new Error(`Supabase error: ${res.status}`);
+              error.status = res.status;
+              throw error;
+            }
+            return res;
+          },
+          { context }
+        );
+      });
+      const text = await response.text();
+      const data = text ? Parser.safeJsonParse(text, text) : null;
+      return { ok: true, status: response.status, data };
+    } catch (error) {
+      logger.error("Supabase request failed", {
+        endpoint, method, error: error.message, circuitOpen: error.circuitOpen || false
+      });
+      return { ok: false, status: error.status || 0, data: null, error: error.message };
+    }
   }
 
-  // Prewarm: store dynamic instructions + desired language mode + company prompts
-  if (req.method === "POST" && req.url === "/prewarm") {
-    let body = "";
-    req.on("data", (c) => body += c);
-    req.on("end", () => {
-      const data = safeJsonParse(body) || {};
-      const prepId = data.prep_id || uuidv4();
-      const s = getSession(prepId);
-
-      s.companyId = data.company_id || s.companyId || "sandbox";
-      s.companyPrompt = data.company_prompt || s.companyPrompt || "";
-      s.campaignScript = data.campaign_script || s.campaignScript || "";
-      s.dynamicInstructions = data.dynamic_instructions || s.dynamicInstructions || "";
-
-      const lang = String(data.language || "auto").toLowerCase();
-      if (lang === "en" || lang === "es") s.language = lang;
-      // auto mode starts EN, switches when user speaks
-      if (lang === "auto") s.language = "en";
-
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, prep_id: prepId }));
-    });
-    return;
+  static async insertReturning(table, row) {
+    const res = await this.request(table, "POST", row, "return=representation");
+    if (!res.ok) return null;
+    return Array.isArray(res.data) ? res.data[0] : res.data;
   }
 
-  // Twilio inbound voice webhook -> TwiML streaming
-  if (req.method === "POST" && req.url === "/twilio/voice") {
-    if (!PUBLIC_BASE_URL) {
-      res.writeHead(500, { "Content-Type": "text/plain" });
-      res.end("Missing PUBLIC_BASE_URL");
-      return;
+  /**
+   * Multi-source agent config loader: agents_new â†’ autoprompt â†’ ai_agents â†’ bc_agents
+   */
+  static async loadAgentConfig(agentId, companyId) {
+    const cacheKey = agentId + "_" + (companyId || "");
+    const cached = agentConfigCache.get(cacheKey);
+    if (cached && Date.now() - cached._ts < 300000) return cached;
+
+    logger.info("Loading agent config", { agentId, companyId });
+
+    const config = {
+      agentId, companyId,
+      voice: DEFAULT_VOICE,
+      systemPrompt: "You are a helpful assistant.",
+      firstMessage: null,
+      language: DEFAULT_LANGUAGE,
+      companyName: null,
+      companyTimezone: DEFAULT_TIMEZONE,
+      humanAgents: [],
+      webhook_url: null,
+      _ts: Date.now()
+    };
+
+    try {
+      // 1. Try agents_new (production agents)
+      const agentRes = await this.request("agents_new?id=eq." + agentId + "&select=*");
+      if (agentRes.ok && agentRes.data?.[0]) {
+        const agent = agentRes.data[0];
+        config.voice = VoiceMapper.mapToOpenAI(agent.elevenlabs_voice || agent.tts_voice || agent.voice_id);
+        config.language = agent.language_preference || DEFAULT_LANGUAGE;
+        config.companyName = agent.company_name;
+        config.companyId = agent.company_id || companyId;
+      }
+
+      // 2. Load autoprompt (highest priority for system prompt)
+      const autopromptRes = await this.request("agent_autoprompt?agent_id=eq." + agentId + "&select=*");
+      if (autopromptRes.ok && autopromptRes.data?.[0]) {
+        const ap = autopromptRes.data[0];
+        config.systemPrompt = ap.system_prompt || config.systemPrompt;
+        config.firstMessage = ap.first_message;
+        if (ap.languages?.length > 0) config.language = ap.languages[0];
+      }
+
+      // 3. Fallback to ai_agents
+      if (config.systemPrompt === "You are a helpful assistant.") {
+        const aiRes = await this.request("ai_agents?agent_id=eq." + agentId + "&select=*");
+        if (aiRes.ok && aiRes.data?.[0]) {
+          config.systemPrompt = aiRes.data[0].system_prompt || config.systemPrompt;
+          config.firstMessage = config.firstMessage || aiRes.data[0].first_message;
+        }
+      }
+
+      // 4. Try bc_agents (Blue Core sandbox)
+      if (config.systemPrompt === "You are a helpful assistant.") {
+        const bcRes = await this.request("bc_agents?id=eq." + agentId + "&select=*");
+        if (bcRes.ok && bcRes.data?.[0]) {
+          const bcAgent = bcRes.data[0];
+          config.systemPrompt = bcAgent.system_prompt_base || config.systemPrompt;
+          config.voice = VoiceMapper.mapToOpenAI(bcAgent.voice_provider || DEFAULT_VOICE);
+          config.language = bcAgent.language_default || config.language;
+          logger.info("Agent loaded from bc_agents", { agentId });
+        }
+      }
+
+      // 5. Load company (try companies, then bc_companies)
+      const effectiveCompanyId = config.companyId || companyId;
+      if (effectiveCompanyId) {
+        const companyRes = await this.request("companies?id=eq." + effectiveCompanyId + "&select=name,timezone");
+        if (companyRes.ok && companyRes.data?.[0]) {
+          config.companyName = config.companyName || companyRes.data[0].name;
+          config.companyTimezone = companyRes.data[0].timezone || DEFAULT_TIMEZONE;
+        }
+        if (!config.companyName) {
+          const bcCompRes = await this.request("bc_companies?id=eq." + effectiveCompanyId + "&select=name");
+          if (bcCompRes.ok && bcCompRes.data?.[0]) {
+            config.companyName = bcCompRes.data[0].name;
+            logger.info("Company loaded from bc_companies", { companyId: effectiveCompanyId });
+          }
+        }
+
+        // 6. Load human agents for transfer
+        const humanRes = await this.request("agents_new?company_id=eq." + effectiveCompanyId + "&type=eq.human&status=eq.active&select=id,display_name");
+        if (humanRes.ok && humanRes.data) {
+          config.humanAgents = humanRes.data.map(a => ({ id: a.id, name: a.display_name }));
+        }
+      }
+    } catch (e) {
+      logger.error("Agent config load error", { agentId, error: e.message });
     }
-    const wsUrl = `${PUBLIC_BASE_URL.replace(/^http/, "ws")}/twilio-stream`;
 
-    // NOTE: language can start "auto" by passing language=auto; session starts EN then auto-detect.
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="${xmlEscape(wsUrl)}">
-      <Parameter name="company_id" value="sandbox"/>
-      <Parameter name="language" value="auto"/>
-    </Stream>
-  </Connect>
-</Response>`;
-
-    res.writeHead(200, { "Content-Type": "text/xml" });
-    res.end(twiml);
-    return;
+    agentConfigCache.set(cacheKey, config);
+    return config;
   }
 
-  // Outbound call trigger
-  if (req.method === "POST" && req.url === "/twilio/outbound") {
-    if (!PUBLIC_BASE_URL) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: false, error: "Missing PUBLIC_BASE_URL" }));
-      return;
-    }
-    if (!TWILIO_FROM_NUMBER) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: false, error: "Missing TWILIO_FROM_NUMBER" }));
-      return;
-    }
-
-    let body = "";
-    req.on("data", (c) => body += c);
-    req.on("end", async () => {
-      const data = safeJsonParse(body) || {};
-      const to = data.to;
-      if (!to) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "Missing 'to'" }));
+  /**
+   * Load prep session from DB: call_prep_sessions â†’ bc_call_prep_sessions
+   */
+  static async loadPrepSession(prepId, session) {
+    logger.info("Loading prep session from DB", { prepId });
+    try {
+      // Try production call_prep_sessions
+      const res = await this.request("call_prep_sessions?prep_id=eq." + prepId + "&select=*");
+      if (res.ok && res.data?.[0]) {
+        const prep = res.data[0];
+        session.dynamicInstructions = prep.dynamic_instructions || session.dynamicInstructions;
+        session.language = prep.language || session.language;
+        if (prep.dynamic_instructions_mode) session.dynamicInstructionsMode = prep.dynamic_instructions_mode;
+        if (prep.first_message) session.dynamicFirstMessage = prep.first_message;
+        if (prep.contact_name) {
+          session.preloadedContact = session.preloadedContact || {};
+          session.preloadedContact.name = prep.contact_name;
+          session.preloadedContact.safeName = BusinessNameDetector.getSafeContactName(prep.contact_name);
+        }
+        logger.info("Prep loaded from call_prep_sessions", { prepId, hasInstructions: !!session.dynamicInstructions });
         return;
       }
 
-      // Optional: prewarm session data (prep_id)
-      const prepId = data.prep_id || uuidv4();
-      const s = getSession(prepId);
-      s.companyId = data.company_id || "sandbox";
-      s.companyPrompt = data.company_prompt || "";
-      s.campaignScript = data.campaign_script || "";
-      s.dynamicInstructions = data.dynamic_instructions || "";
+      // Fallback: Blue Core bc_call_prep_sessions
+      const bcRes = await this.request("bc_call_prep_sessions?id=eq." + prepId + "&select=*");
+      if (bcRes.ok && bcRes.data?.[0]) {
+        const bcPrep = bcRes.data[0];
+        session.dynamicInstructions = bcPrep.dynamic_instructions || session.dynamicInstructions;
+        session.language = bcPrep.language || session.language;
+        logger.info("Prep loaded from bc_call_prep_sessions", { prepId });
+      }
+    } catch (e) {
+      logger.error("Prep session load error", { prepId, error: e.message });
+    }
+  }
+}
 
-      const lang = String(data.language || "auto").toLowerCase();
-      s.language = (lang === "es" || lang === "en") ? lang : "en";
+/**
+ * CRMToolsClient - Execute CRM tools via Edge Function
+ */
+class CRMToolsClient {
+  static async executeTool(toolName, args, context) {
+    const payload = {
+      tool_name: toolName,
+      arguments: args,
+      context: {
+        company_id: context.companyId,
+        agent_id: context.agentId,
+        call_sid: context.callSid,
+        customer_phone: context.customerPhone || "",
+        direction: context.direction || "inbound"
+      }
+    };
 
-      const voiceWebhook = `${PUBLIC_BASE_URL}/twilio/voice`;
+    const requestContext = { toolName, callSid: context.callSid };
 
-      try {
-        const client = requireTwilio();
-        const call = await client.calls.create({
-          to,
-          from: TWILIO_FROM_NUMBER,
-          url: voiceWebhook,
-          method: "POST"
-          // recording: set at Twilio number settings or add record=true in TwiML later
+    try {
+      const response = await crmToolsCircuit.execute(async () => {
+        return await RetryManager.execute(
+          async () => {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), TOOL_EXECUTION_TIMEOUT_MS);
+            try {
+              const res = await fetch(CRM_TOOLS_URL, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`
+                },
+                body: JSON.stringify(payload),
+                signal: controller.signal
+              });
+              clearTimeout(timeout);
+              if (!res.ok) {
+                const error = new Error(`CRM Tools error: ${res.status}`);
+                error.status = res.status;
+                throw error;
+              }
+              return res;
+            } catch (error) {
+              clearTimeout(timeout);
+              throw error;
+            }
+          },
+          { context: requestContext }
+        );
+      });
+
+      const data = await response.json();
+      logger.info("CRM tool executed", { toolName, callSid: context.callSid, success: data.success !== false });
+      return data;
+    } catch (error) {
+      logger.error("CRM tool execution failed", {
+        toolName, callSid: context.callSid, error: error.message, circuitOpen: error.circuitOpen || false
+      });
+      return { success: false, error: error.message, fallback: "Tool execution failed. Please try again." };
+    }
+  }
+}
+
+/**
+ * WebhookClient - Send post-call webhooks (RESTORED from v6.0)
+ */
+class WebhookClient {
+  static async send(url, payload) {
+    if (!ENABLE_WEBHOOKS || !url) return;
+
+    try {
+      await RetryManager.execute(
+        async () => {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), WEBHOOK_TIMEOUT_MS);
+          try {
+            const res = await fetch(url, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(payload),
+              signal: controller.signal
+            });
+            clearTimeout(timeout);
+            if (!res.ok) {
+              throw new Error(`Webhook failed: ${res.status}`);
+            }
+            logger.info("Webhook sent", { url, callSid: payload.call_sid });
+          } catch (error) {
+            clearTimeout(timeout);
+            throw error;
+          }
+        },
+        { maxRetries: 2, context: { webhook: url } }
+      );
+    } catch (error) {
+      logger.error("Webhook failed after retries", { url, error: error.message });
+    }
+  }
+}
+
+
+// ============================================================
+// SECTION 6: BUSINESS LOGIC
+// ============================================================
+
+/**
+ * BusinessNameDetector - Detect and filter business/placeholder names (from v6.1)
+ */
+class BusinessNameDetector {
+  static INDICATORS = [
+    "llc", "inc", "corp", "corporation", "ltd", "limited", "co", "company", "enterprises",
+    "holdings", "shop", "salon", "restaurant", "store", "studio", "garage", "clinic",
+    "office", "agency", "group", "market", "services", "solutions", "consulting",
+    "associates", "partners", "industries", "construction", "plumbing", "electric",
+    "auto", "automotive", "trucking", "transport", "cleaning", "landscaping", "roofing",
+    "hvac", "flooring", "painting", "remodeling", "barbershop", "barber", "hair", "nails",
+    "spa", "beauty", "fitness", "gym", "dental", "medical", "law", "legal",
+    "homes", "home", "signature", "network", "grill", "bar", "cafe", "coffee", "pizza",
+    "tacos", "food", "express", "delivery", "moving", "movers", "storage", "rental",
+    "academy", "school", "training", "center", "centre", "club", "foundation",
+    "taller", "tienda", "peluquerÃ­a", "barberÃ­a", "restaurante", "clÃ­nica", "estudio",
+    "servicios", "constructora", "mecÃ¡nica", "carpinterÃ­a", "panaderÃ­a",
+    "dominicanos", "mexicanos", "latinos", "hispanos",
+    "the ", " & ", " and ", " y ", "realty", "real estate", "insurance",
+    "marketing", "media", "design", "tech", "technology", "digital", "professional"
+  ];
+
+  static PATTERNS = [/\|/, /\b(rd|llc|inc|corp)\b/i, /\d{3,}/, /^[A-Z\s&]+$/];
+
+  static PLACEHOLDER_NAMES = [
+    "unknown", "desconocido", "anÃ³nimo", "anonimo", "anonymous",
+    "null", "undefined", "n/a", "na", "none", "no name", "sin nombre",
+    "cliente", "customer", "user", "usuario", "contact", "contacto",
+    "no disponible", "not available", "pending", "pendiente"
+  ];
+
+  static isBusinessName(name) {
+    if (!name || typeof name !== "string" || name.trim().length === 0) return false;
+    const normalized = Parser.normalizeUnicode(name);
+    const lower = normalized.toLowerCase().trim();
+    for (const ind of this.INDICATORS) { if (lower.includes(ind)) return true; }
+    for (const pat of this.PATTERNS) { if (pat.test(normalized)) return true; }
+    if (normalized === normalized.toUpperCase() && normalized.length > 5 && normalized.includes(" ") && !/[a-z]/.test(normalized)) return true;
+    return false;
+  }
+
+  static getSafeContactName(name) {
+    if (!name || typeof name !== "string") return null;
+    const trimmed = name.trim();
+    if (trimmed.length === 0) return null;
+    const lower = trimmed.toLowerCase();
+    if (this.PLACEHOLDER_NAMES.includes(lower)) return null;
+    const prefixes = ["unknown", "desconocido", "anon", "cliente #", "customer #", "lead #"];
+    for (const p of prefixes) { if (lower.startsWith(p)) return null; }
+    if (this.isBusinessName(trimmed)) return null;
+    return trimmed;
+  }
+}
+
+/**
+ * LanguageDetector - Automatic language detection
+ */
+class LanguageDetector {
+  static detect(text) {
+    if (!text || text.length < 5) return null;
+
+    const scores = {};
+    for (const [lang, config] of Object.entries(SUPPORTED_LANGUAGES)) {
+      scores[lang] = 0;
+      for (const pattern of config.patterns) {
+        if (pattern.test(text)) scores[lang]++;
+      }
+    }
+
+    let maxScore = 0;
+    let detectedLang = null;
+    for (const [lang, score] of Object.entries(scores)) {
+      if (score > maxScore) { maxScore = score; detectedLang = lang; }
+    }
+
+    if (maxScore < 1) return null;
+
+    logger.debug("Language detected", { text: text.substring(0, 50), detected: detectedLang, score: maxScore });
+    return detectedLang;
+  }
+
+  static async updateSessionLanguage(session, newLanguage) {
+    if (!Validator.isValidLanguage(newLanguage)) return false;
+    if (session.language === newLanguage) return false;
+
+    const oldLanguage = session.language;
+    session.language = newLanguage;
+    logger.info("Language changed", { callSid: session.callSid, from: oldLanguage, to: newLanguage });
+
+    if (session.sessionReady && session.openaiWs && session.config) {
+      OpenAIHandler.sendSessionUpdate(session);
+    }
+    return true;
+  }
+}
+
+/**
+ * VoicemailDetector - Detect voicemail and IVR systems
+ */
+class VoicemailDetector {
+  static detect(text) {
+    if (!text || text.length < 10) return false;
+    return VOICEMAIL_PATTERNS.some(p => p.test(text));
+  }
+
+  static async handleDetection(session) {
+    if (session.voicemailHandled) return;
+    session.voicemailHandled = true;
+
+    logger.warn("Voicemail detected", { callSid: session.callSid });
+
+    try {
+      await CRMToolsClient.executeTool(
+        "end_call",
+        {
+          reason: "voicemail_detected", outcome: "voicemail",
+          phone: session.customerPhone || "",
+          contactName: session.preloadedContact?.name || "",
+          goodbye_message: ""
+        },
+        { companyId: session.companyId, agentId: session.agentId, callSid: session.callSid }
+      );
+    } catch (error) {
+      logger.error("Voicemail handler error", { callSid: session.callSid, error: error.message });
+    }
+
+    session.callEnding = true;
+    setTimeout(() => {
+      if (session.openaiWs?.readyState === WebSocket.OPEN) session.openaiWs.close(1000, "voicemail");
+      setTimeout(() => {
+        if (session.twilioWs?.readyState === WebSocket.OPEN) session.twilioWs.close(1000, "voicemail");
+      }, 500);
+    }, 500);
+  }
+}
+
+/**
+ * AutoHangupManager - Manage automatic call termination
+ */
+class AutoHangupManager {
+  static checkForGoodbye(session, transcript) {
+    if (!transcript || session.callEnding) return;
+
+    // Skip goodbye detection on first assistant message (inbound greeting protection)
+    if (!session.greetingMessageSent) {
+      session.greetingMessageSent = true;
+      logger.debug("Skipping goodbye check on first message", { callSid: session.callSid });
+      return;
+    }
+
+    if (GOODBYE_PATTERNS.some(p => p.test(transcript))) {
+      logger.info("Goodbye pattern detected", { callSid: session.callSid, transcript: transcript.substring(0, 50) });
+      this.scheduleHangup(session);
+    }
+  }
+
+  static scheduleHangup(session) {
+    if (session.autoHangupTimer) clearTimeout(session.autoHangupTimer);
+
+    session.autoHangupTimer = setTimeout(() => {
+      if (!session.callEnding) {
+        logger.info("Auto-hangup triggered", { callSid: session.callSid });
+        session.callEnding = true;
+        if (session.openaiWs?.readyState === WebSocket.OPEN) session.openaiWs.close(1000, "auto_hangup");
+        setTimeout(() => {
+          if (session.twilioWs?.readyState === WebSocket.OPEN) session.twilioWs.close(1000, "auto_hangup");
+        }, 500);
+      }
+    }, AUTO_HANGUP_TIMEOUT_MS);
+  }
+
+  static cancelHangup(session) {
+    if (session.autoHangupTimer) {
+      clearTimeout(session.autoHangupTimer);
+      session.autoHangupTimer = null;
+      logger.debug("Auto-hangup cancelled", { callSid: session.callSid });
+    }
+  }
+}
+
+/**
+ * SpamFilter - Filter spam and sales calls
+ */
+class SpamFilter {
+  static isSpamNumber(phone) {
+    if (!phone) return false;
+    const normalized = Parser.normalizePhone(phone);
+    return SPAM_PATTERNS.some(pattern => pattern.test(normalized));
+  }
+
+  static shouldBlockCall(fromNumber) {
+    if (this.isSpamNumber(fromNumber)) {
+      logger.info("Spam number blocked", { fromNumber });
+      return { blocked: true, reason: "Spam number detected" };
+    }
+    return { blocked: false };
+  }
+}
+
+/**
+ * ToolDeduplicator - Prevent duplicate tool executions
+ */
+class ToolDeduplicator {
+  static shouldExecute(session, toolName, args) {
+    if (NEVER_DEDUP_TOOLS.includes(toolName)) return { shouldExecute: true };
+
+    const recentCalls = (session.toolCalls || []).filter(
+      call => Date.now() - (call.timestamp || call.ts) < 10000
+    );
+
+    for (const call of recentCalls) {
+      if (call.name === toolName && JSON.stringify(call.args) === JSON.stringify(args)) {
+        logger.warn("Duplicate tool call blocked", {
+          callSid: session.callSid, toolName,
+          lastCallAgo: Date.now() - (call.timestamp || call.ts)
         });
+        return { shouldExecute: false, reason: "Duplicate call detected", previousResult: call.result };
+      }
+    }
+    return { shouldExecute: true };
+  }
 
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, call_sid: call.sid, prep_id: prepId }));
-      } catch (e) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: e.message }));
+  static recordExecution(session, toolName, args, result) {
+    if (!session.toolCalls) session.toolCalls = [];
+    session.toolCalls.push({ name: toolName, args, result, timestamp: Date.now() });
+    if (session.toolCalls.length > 20) session.toolCalls = session.toolCalls.slice(-20);
+  }
+}
+
+/**
+ * PromptBuilder - Build enhanced prompts with dynamic instruction support
+ */
+class PromptBuilder {
+  static build(session, config) {
+    // Full dynamic mode â€” replace entire prompt
+    if (session.dynamicInstructions && session.dynamicInstructionsMode === "full") {
+      return session.dynamicInstructions;
+    }
+
+    const isOutbound = session.direction === "outbound";
+    const customerPhone = session.customerPhone || session.fromNumber || session.toNumber || "";
+    const primaryLang = (session.language || config.language || DEFAULT_LANGUAGE) === "en" ? "English" : "Spanish";
+    const secondaryLang = primaryLang === "English" ? "Spanish" : "English";
+    const safeName = session.preloadedContact ? BusinessNameDetector.getSafeContactName(session.preloadedContact.name) : null;
+
+    const parts = [];
+
+    // Language configuration
+    parts.push("## MANDATORY LANGUAGE CONFIGURATION");
+    parts.push(`PRIMARY LANGUAGE: ${primaryLang.toUpperCase()}`);
+    parts.push(`Start and continue in ${primaryLang}. Only switch if customer speaks ${secondaryLang} first.`);
+    parts.push("");
+
+    // Demo mode
+    if (session.isDemoCall) {
+      parts.push("## DEMO MODE â€” NO SCHEDULING");
+      parts.push("Redirect to self-serve signup link instead.");
+      parts.push("");
+    }
+
+    // Dynamic instructions (addon mode)
+    if (session.dynamicInstructions && session.dynamicInstructionsMode !== "full") {
+      parts.push("## DYNAMIC INSTRUCTIONS (PRIORITY)");
+      parts.push(session.dynamicInstructions);
+      parts.push("");
+    }
+
+    // Base system prompt
+    parts.push(config.systemPrompt || "You are a helpful assistant.");
+    parts.push("");
+
+    // Call direction
+    if (isOutbound) {
+      parts.push("CALL DIRECTION: OUTBOUND â€” YOU initiated this call. Do NOT ask 'how can I help you?'");
+    } else {
+      parts.push("CALL DIRECTION: INBOUND â€” Customer called YOU. Greet and ask how you can help.");
+    }
+
+    // Contact info
+    if (safeName) {
+      parts.push(`\nCUSTOMER: ${safeName} (Phone: ${customerPhone})`);
+    } else if (customerPhone) {
+      parts.push(`\nAfter greeting, call lookup_contact with phone ${customerPhone}.`);
+    }
+
+    // CRM rules
+    let crmRules = "\nCRM RULES: Identify contact â†’ create_lead if interest â†’ ";
+    if (!session.isDemoCall) crmRules += "schedule_appointment if requested â†’ ";
+    crmRules += "take_note before ending.";
+    parts.push(crmRules);
+
+    // Human agents
+    if (config.humanAgents?.length) {
+      parts.push("\nHuman agents: " + config.humanAgents.map(a => a.name).join(", "));
+    }
+
+    // Timezone
+    parts.push(`\nTIMEZONE: ${config.companyTimezone || DEFAULT_TIMEZONE}`);
+
+    return parts.join("\n");
+  }
+}
+
+/**
+ * VoiceMapper - Map voice names to OpenAI voices
+ */
+class VoiceMapper {
+  static VOICE_MAP = {
+    sarah: "shimmer", rachel: "alloy", domi: "coral", bella: "sage",
+    antoni: "ash", elli: "shimmer", josh: "echo", arnold: "verse",
+    adam: "ballad", sam: "marin", aria: "shimmer"
+  };
+
+  static mapToOpenAI(voice) {
+    if (!voice) return DEFAULT_VOICE;
+    const lower = String(voice).toLowerCase();
+    if (VALID_OPENAI_VOICES.includes(lower)) return lower;
+    return this.VOICE_MAP[lower] || DEFAULT_VOICE;
+  }
+}
+
+
+// ============================================================
+// SECTION 7: TOOL EXECUTION
+// ============================================================
+
+/**
+ * ToolExecutor - Execute tools with deduplication, metrics, and response routing
+ */
+class ToolExecutor {
+  static getCustomerPhone(session, args) {
+    const phone = args.phone || session.customerPhone ||
+      (session.direction === "outbound" ? session.toNumber : session.fromNumber) ||
+      session.fromNumber || session.toNumber;
+    if (phone && !args.phone) args.phone = phone;
+    return Parser.normalizePhone(phone);
+  }
+
+  static async execute(session, toolName, callId, args) {
+    if (session.callEnding) {
+      logger.debug("Tool blocked (call ending)", { toolName, callSid: session.callSid });
+      return;
+    }
+
+    const startTime = Date.now();
+    logger.info("Tool execution started", { callSid: session.callSid, toolName, callId });
+
+    // Check deduplication
+    const dedupCheck = ToolDeduplicator.shouldExecute(session, toolName, args);
+    if (!dedupCheck.shouldExecute) {
+      const result = dedupCheck.previousResult || { success: false, error: "Duplicate call detected" };
+      this._sendToolResult(session, callId, result, toolName);
+      return result;
+    }
+
+    let result;
+
+    try {
+      if (toolName === "end_call") {
+        result = await this._executeEndCall(session, args);
+      } else if (toolName === "transfer_to_human") {
+        result = await this._executeTransfer(session, args);
+      } else if (toolName === "lookup_contact") {
+        result = await this._executeLookup(session, args);
+      } else {
+        const phone = this.getCustomerPhone(session, args);
+        result = await CRMToolsClient.executeTool(toolName, { ...args, phone }, {
+          companyId: session.companyId, agentId: session.agentId,
+          callSid: session.callSid, customerPhone: phone, direction: session.direction
+        });
+      }
+    } catch (error) {
+      result = { success: false, error: error.message };
+    }
+
+    const duration = Date.now() - startTime;
+    ToolDeduplicator.recordExecution(session, toolName, args, result);
+    logger.info("Tool execution completed", { callSid: session.callSid, toolName, durationMs: duration, success: result?.success !== false });
+
+    this._sendToolResult(session, callId, result, toolName);
+    return result;
+  }
+
+  static _sendToolResult(session, callId, result, toolName) {
+    if (session.openaiWs?.readyState === WebSocket.OPEN && !session.callEnding) {
+      session.openaiWs.send(JSON.stringify({
+        type: "conversation.item.create",
+        item: { type: "function_call_output", call_id: callId, output: JSON.stringify(result) }
+      }));
+      if (!session.callEnding) {
+        ResponseLockManager.sendResponseCreateSafe(
+          session,
+          { type: "response.create", response: { modalities: ["text", "audio"] } },
+          "tool_" + toolName
+        );
+      }
+    }
+  }
+
+  static async _executeEndCall(session, args) {
+    logger.info("End call processing", { callSid: session.callSid });
+    const goodbye = args.goodbye_message || args.goodbyeMessage || "Goodbye, have a great day!";
+
+    if (session.openaiWs?.readyState === WebSocket.OPEN) {
+      session.openaiWs.send(JSON.stringify({
+        type: "conversation.item.create",
+        item: {
+          type: "message", role: "system",
+          content: [{ type: "input_text", text: `[END CALL - MANDATORY GOODBYE] Say exactly: "${goodbye}" â€” Do NOT add anything else.` }]
+        }
+      }));
+      ResponseLockManager.sendResponseCreateSafe(
+        session,
+        { type: "response.create", response: { modalities: ["text", "audio"] } },
+        "end_call"
+      );
+    }
+
+    session.callEnding = true;
+    setTimeout(() => {
+      if (session.openaiWs?.readyState === WebSocket.OPEN) session.openaiWs.close(1000, "end_call");
+      setTimeout(() => {
+        if (session.twilioWs?.readyState === WebSocket.OPEN) session.twilioWs.close(1000, "end_call");
+      }, 500);
+    }, 3500);
+
+    return { success: true, message: "Call ended" };
+  }
+
+  static async _executeTransfer(session, args) {
+    if (!session.config?.humanAgents?.length) return { success: false, error: "No human agents available" };
+    const name = args.agent_name || args.agentName || args.reason;
+    let target = name ? session.config.humanAgents.find(a => a.name.toLowerCase().includes(name.toLowerCase())) : null;
+    if (!target) target = session.config.humanAgents[0];
+    if (!target) return { success: false, error: "Agent not found" };
+
+    try {
+      const profileRes = await SupabaseClient.request("agent_profiles?agent_id=eq." + target.id + "&select=dial_target,phone");
+      const dialTarget = profileRes.ok && profileRes.data?.[0] ? (profileRes.data[0].dial_target || profileRes.data[0].phone) : null;
+      if (!dialTarget) return { success: false, error: "No phone for " + target.name };
+      return { success: true, transfer_to: dialTarget, agent_name: target.name, action: "transfer" };
+    } catch (e) {
+      return { success: false, error: e.message };
+    }
+  }
+
+  static async _executeLookup(session, args) {
+    if (session.preloadedContact) return { found: true, contact: session.preloadedContact, source: "preloaded" };
+    const phone = this.getCustomerPhone(session, args);
+    try {
+      const res = await SupabaseClient.request("crm_contacts?phone=eq." + encodeURIComponent(phone) + "&select=*");
+      if (res.ok && res.data?.[0]) {
+        const c = res.data[0];
+        session.preloadedContact = {
+          id: c.id, name: c.name || c.full_name,
+          email: c.email, phone: c.phone,
+          language: c.language || DEFAULT_LANGUAGE
+        };
+        return { found: true, contact: session.preloadedContact };
+      }
+      return { found: false, message: "Contact not found" };
+    } catch (e) {
+      return { found: false, error: e.message };
+    }
+  }
+
+  static buildToolDefinitions(session, config) {
+    const tools = [];
+    const hasContact = session.preloadedContact?.name;
+    const isDemoCall = session.isDemoCall === true;
+
+    if (!hasContact) {
+      tools.push({ type: "function", name: "lookup_contact", description: "Look up contact by phone number.", parameters: { type: "object", properties: { phone: { type: "string", description: "Phone number to search" }, email: { type: "string", description: "Email to search" } } } });
+    }
+
+    tools.push({ type: "function", name: "create_or_merge_contact", description: "Create new contact or update existing.", parameters: { type: "object", properties: { phone: { type: "string" }, name: { type: "string" }, email: { type: "string" } }, required: ["phone", "name"] } });
+    tools.push({ type: "function", name: "create_lead", description: "Create a lead for opportunity tracking.", parameters: { type: "object", properties: { contact_id: { type: "string" }, phone: { type: "string" }, title: { type: "string" }, notes: { type: "string" }, temperature: { type: "string", enum: ["hot", "warm", "cold"] } }, required: ["title"] } });
+
+    if (!isDemoCall) {
+      tools.push({ type: "function", name: "schedule_appointment", description: "Schedule an appointment.", parameters: { type: "object", properties: { phone: { type: "string" }, name: { type: "string" }, start_at: { type: "string", description: "ISO datetime" }, title: { type: "string" }, notes: { type: "string" } }, required: ["start_at"] } });
+    }
+
+    tools.push({ type: "function", name: "check_appointments", description: "Check upcoming appointments.", parameters: { type: "object", properties: { phone: { type: "string" } }, required: ["phone"] } });
+    tools.push({ type: "function", name: "take_note", description: "Save a note about the call.", parameters: { type: "object", properties: { note: { type: "string" } }, required: ["note"] } });
+    tools.push({ type: "function", name: "send_message", description: "Send an SMS to the customer.", parameters: { type: "object", properties: { phone: { type: "string" }, message: { type: "string" } }, required: ["message"] } });
+    tools.push({ type: "function", name: "send_email", description: "Send an email.", parameters: { type: "object", properties: { email: { type: "string" }, subject: { type: "string" }, body: { type: "string" } }, required: ["subject", "body"] } });
+    tools.push({ type: "function", name: "transfer_to_human", description: "Transfer call to a human agent.", parameters: { type: "object", properties: { agent_name: { type: "string" }, reason: { type: "string" } }, required: ["reason"] } });
+    tools.push({ type: "function", name: "end_call", description: "End the call politely.", parameters: { type: "object", properties: { reason: { type: "string" }, outcome: { type: "string" }, goodbye_message: { type: "string" } } } });
+
+    return tools;
+  }
+}
+
+
+// ============================================================
+// SECTION 8: HANDLERS
+// ============================================================
+
+/**
+ * OpenAIHandler - Handle OpenAI Realtime API connections and messages
+ */
+class OpenAIHandler {
+  static async connect(session) {
+    const startTime = Date.now();
+
+    try {
+      const ws = await openaiCircuit.execute(async () => {
+        return new Promise((resolve, reject) => {
+          const wsUrl = `wss://api.openai.com/v1/realtime?model=${OPENAI_REALTIME_MODEL}`;
+          const openaiWs = new WebSocket(wsUrl, {
+            headers: {
+              "Authorization": `Bearer ${OPENAI_API_KEY}`,
+              "OpenAI-Beta": "realtime=v1"
+            }
+          });
+
+          const timeout = setTimeout(() => {
+            openaiWs.close();
+            reject(new Error("OpenAI connection timeout"));
+          }, 10000);
+
+          openaiWs.on("open", () => { clearTimeout(timeout); resolve(openaiWs); });
+          openaiWs.on("error", (error) => { clearTimeout(timeout); reject(error); });
+        });
+      });
+
+      session.openaiWs = ws;
+      session.metrics.t_openai_connected = Date.now();
+      logger.info("OpenAI connected", { callSid: session.callSid || "prewarm", durationMs: Date.now() - startTime });
+      this.setupMessageHandler(session);
+      return ws;
+    } catch (error) {
+      logger.error("OpenAI connection failed", { callSid: session.callSid, error: error.message });
+      throw error;
+    }
+  }
+
+  static setupMessageHandler(session) {
+    const ws = session.openaiWs;
+    ResponseLockManager.init(session);
+
+    ws.on("message", async (data) => {
+      const event = Parser.safeJsonParse(data.toString(), null);
+      if (!event) return;
+
+      switch (event.type) {
+        case "session.created":
+          session.sessionCreated = true;
+          logger.info("OpenAI session created", { callSid: session.callSid || "prewarm" });
+          if (session.config && session.configReady) {
+            this.sendSessionUpdate(session);
+          }
+          break;
+
+        case "session.updated":
+          session.sessionReady = true;
+          session.pendingSessionUpdate = false;
+          if (session.metrics) session.metrics.t_session_ready = Date.now();
+          logger.info("OpenAI session updated", { callSid: session.callSid || "prewarm" });
+          TwilioHandler.tryTriggerGreetingWhenReady(session);
+          break;
+
+        case "response.audio.delta":
+          if (session.twilioWs?.readyState === WebSocket.OPEN && session.streamSid) {
+            if (!session.firstAudioSent) {
+              session.firstAudioSent = true;
+              session.metrics.t_first_audio_sent = Date.now();
+              TwilioHandler.stopRingback(session);
+              logger.info("First audio sent", {
+                callSid: session.callSid,
+                latencyMs: session.metrics.t_first_audio_sent - (session.metrics.t_stream_start || session.metrics.t_session_created)
+              });
+            }
+            session.twilioWs.send(JSON.stringify({
+              event: "media", streamSid: session.streamSid,
+              media: { payload: event.delta }
+            }));
+          }
+          break;
+
+        case "response.audio_transcript.done":
+          if (event.transcript) {
+            session.transcripts.assistant.push(event.transcript);
+            logger.debug("Assistant transcript", { callSid: session.callSid, transcript: event.transcript.substring(0, 100) });
+            if (!session.callEnding) {
+              AutoHangupManager.checkForGoodbye(session, event.transcript);
+            }
+          }
+          break;
+
+        case "conversation.item.input_audio_transcription.completed":
+          if (event.transcript) {
+            session.transcripts.user.push(event.transcript);
+            logger.debug("User transcript", { callSid: session.callSid, transcript: event.transcript.substring(0, 100) });
+            AutoHangupManager.cancelHangup(session);
+
+            // Language detection
+            const detectedLang = LanguageDetector.detect(event.transcript);
+            if (detectedLang && detectedLang !== session.language) {
+              await LanguageDetector.updateSessionLanguage(session, detectedLang);
+            }
+
+            // Voicemail detection
+            if (!session.voicemailHandled && VoicemailDetector.detect(event.transcript)) {
+              await VoicemailDetector.handleDetection(session);
+            }
+          }
+          break;
+
+        case "response.done":
+          ResponseLockManager.unlock(session, "response.done");
+          break;
+
+        case "response.function_call_arguments.done":
+          await ToolExecutor.execute(session, event.name, event.call_id, Parser.safeJsonParse(event.arguments, {}));
+          break;
+
+        case "error":
+          logger.error("OpenAI error", { callSid: session.callSid, error: JSON.stringify(event.error) });
+          break;
       }
     });
+
+    ws.on("close", (code, reason) => {
+      logger.info("OpenAI connection closed", { callSid: session.callSid || "prewarm", code });
+      if (session.callSid) this.syncTranscripts(session);
+    });
+
+    ws.on("error", (error) => {
+      logger.error("OpenAI WebSocket error", { callSid: session.callSid, error: error.message });
+    });
+  }
+
+  static sendSessionUpdate(session) {
+    if (!session.openaiWs || session.openaiWs.readyState !== WebSocket.OPEN) return;
+
+    const config = session.config;
+    const prompt = PromptBuilder.build(session, config);
+    const voice = VoiceMapper.mapToOpenAI(config.voice);
+    const tools = ToolExecutor.buildToolDefinitions(session, config);
+
+    const promptSource = session.dynamicInstructions
+      ? (session.dynamicInstructionsMode === "full" ? "dynamic_full" : "merged")
+      : "default";
+
+    logger.info("Sending session.update", {
+      callSid: session.callSid || "prewarm",
+      promptSource, promptLength: prompt.length,
+      voice, toolCount: tools.length
+    });
+
+    if (session.callSid) session.pendingSessionUpdate = true;
+
+    session.openaiWs.send(JSON.stringify({
+      type: "session.update",
+      session: {
+        modalities: ["text", "audio"],
+        voice,
+        instructions: prompt,
+        input_audio_format: "g711_ulaw",
+        output_audio_format: "g711_ulaw",
+        input_audio_transcription: { model: "whisper-1" },
+        turn_detection: {
+          type: "server_vad",
+          threshold: 0.5,
+          prefix_padding_ms: 300,
+          silence_duration_ms: 500
+        },
+        tools
+      }
+    }));
+  }
+
+  static async syncTranscripts(session) {
+    if (!session.callSid) return;
+    const userTranscripts = session.transcripts?.user || [];
+    const assistantTranscripts = session.transcripts?.assistant || [];
+    if (userTranscripts.length === 0 && assistantTranscripts.length === 0) return;
+
+    logger.info("Syncing transcripts", {
+      callSid: session.callSid,
+      userCount: userTranscripts.length,
+      assistantCount: assistantTranscripts.length
+    });
+
+    try {
+      await fetch(SYNC_TRANSCRIPT_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`
+        },
+        body: JSON.stringify({
+          call_sid: session.callSid,
+          agent_id: session.agentId,
+          company_id: session.companyId,
+          user_transcripts: userTranscripts,
+          assistant_transcripts: assistantTranscripts,
+          direction: session.direction,
+          from_number: session.fromNumber,
+          to_number: session.toNumber
+        })
+      });
+    } catch (error) {
+      logger.error("Transcript sync failed", { callSid: session.callSid, error: error.message });
+    }
+  }
+}
+
+/**
+ * TwilioHandler - Handle Twilio Media Streams with full param support
+ */
+class TwilioHandler {
+  static async handleConnection(twilioWs, request) {
+    const startTime = Date.now();
+    const sessionId = generateSessionId();
+
+    logger.info("Twilio WebSocket connected", { sessionId });
+
+    // Parse URL params
+    const urlParams = {};
+    if (request.url?.includes("?")) {
+      const qs = request.url.split("?")[1];
+      for (const pair of qs.split("&")) {
+        const [k, v] = pair.split("=");
+        urlParams[k.toLowerCase()] = decodeURIComponent(v || "");
+      }
+    }
+
+    // Create session with initial URL params
+    const session = SessionManager.createSession({
+      sessionId,
+      agentId: urlParams.agentid || urlParams.agent_id || null,
+      companyId: urlParams.companyid || urlParams.company_id || null,
+      direction: urlParams.direction || "inbound",
+      fromNumber: urlParams.from || urlParams.fromnumber || null,
+      toNumber: urlParams.to || urlParams.tonumber || null
+    });
+
+    session.twilioWs = twilioWs;
+
+    twilioWs.on("message", async (data) => {
+      const message = Parser.safeJsonParse(data.toString(), null);
+      if (!message) return;
+
+      try {
+        switch (message.event) {
+          case "connected":
+            logger.debug("Twilio stream connected", { sessionId });
+            break;
+
+          case "start":
+            await this._handleStart(session, message, urlParams);
+            break;
+
+          case "media":
+            if (!session.twilioStreamReady) {
+              session.twilioStreamReady = true;
+              logger.debug("First media received â€” twilioStreamReady", { callSid: session.callSid });
+              this.tryTriggerGreetingWhenReady(session);
+            }
+            if (session.openaiWs?.readyState === WebSocket.OPEN) {
+              session.openaiWs.send(JSON.stringify({
+                type: "input_audio_buffer.append",
+                audio: message.media.payload
+              }));
+            }
+            break;
+
+          case "stop":
+            await this._handleStop(session);
+            break;
+        }
+      } catch (error) {
+        logger.error("Twilio message handler error", { sessionId, event: message.event, error: error.message });
+      }
+    });
+
+    twilioWs.on("close", () => {
+      logger.info("Twilio WebSocket closed", { sessionId, callSid: session.callSid });
+      SessionManager.deleteSession(sessionId);
+    });
+
+    twilioWs.on("error", (error) => {
+      logger.error("Twilio WebSocket error", { sessionId, error: error.message });
+    });
+  }
+
+  static async _handleStart(session, message, urlParams) {
+    session.streamSid = message.streamSid;
+    session.callSid = message.start.callSid;
+    const params = message.start.customParameters || {};
+
+    // Extract phones
+    const extractedFrom = params.From || params.from || params.caller || message.start.from || urlParams.from || session.fromNumber;
+    const extractedTo = params.To || params.to || params.called || message.start.to || urlParams.to || session.toNumber;
+    if (extractedFrom) session.fromNumber = extractedFrom;
+    if (extractedTo) session.toNumber = extractedTo;
+
+    const direction = params.direction || session.direction || "inbound";
+    session.direction = direction;
+    session.customerPhone = direction === "outbound" ? session.toNumber : session.fromNumber;
+
+    session.agentId = params.agentId || params.agent_id || params.agentid || session.agentId;
+    session.companyId = params.companyId || params.company_id || params.companyid || session.companyId;
+
+    logger.info("Stream start", {
+      callSid: session.callSid, direction: session.direction,
+      from: session.fromNumber, to: session.toNumber,
+      agentId: session.agentId, companyId: session.companyId
+    });
+
+    // Validate
+    if (!Validator.isValidUUID(session.agentId) || !Validator.isValidUUID(session.companyId)) {
+      logger.error("Invalid agent/company ID", { agentId: session.agentId, companyId: session.companyId });
+      session.twilioWs.close(1008, "Invalid parameters");
+      return;
+    }
+
+    // Rate limit check
+    const tenantLimit = RateLimiter.checkTenantLimit(session.companyId);
+    if (!tenantLimit.allowed) {
+      logger.warn("Rate limit exceeded", { companyId: session.companyId, reason: tenantLimit.reason });
+      session.twilioWs.close(1008, tenantLimit.reason);
+      return;
+    }
+    RateLimiter.incrementTenantCalls(session.companyId);
+
+    // Spam check (inbound only)
+    if (direction === "inbound") {
+      const spamCheck = SpamFilter.shouldBlockCall(session.fromNumber);
+      if (spamCheck.blocked) {
+        logger.warn("Spam call blocked", { callSid: session.callSid, fromNumber: session.fromNumber });
+        RateLimiter.decrementTenantCalls(session.companyId);
+        session.twilioWs.close(1000, "spam_blocked");
+        return;
+      }
+    }
+
+    // ==================== DECODE TwiML URL PARAMETERS ====================
+    const dynB64 = params.dynB64 || params.dynamicInstructions;
+    const fmB64 = params.fmB64 || params.firstMessage;
+    const skipGreeting = params.skipGreeting === "true" || params.skip_greeting === "true";
+    const prepId = params.prepId || params.prep_id || params.prepid;
+    const preloadedContact = params.preloadedContact || params.contact_name || params.contactName;
+    const urlDynMode = params.dynamicInstructionsMode || params.dynamic_instructions_mode || null;
+    const forceNewSession = params.forceNewSession === "true" || params.force_new_session === "true";
+    const skipPrewarm = params.skipPrewarm === "true" || params.skip_prewarm === "true";
+
+    logger.info("TwiML params", { dynB64: !!dynB64, fmB64: !!fmB64, prepId, forceNew: forceNewSession, skipPrewarm });
+
+    if (dynB64) {
+      const decoded = Parser.decodeBase64Utf8(dynB64);
+      if (decoded) { session.dynamicInstructions = decoded; session.dynamicInstructionsMode = urlDynMode || "full"; }
+    }
+
+    if (fmB64) {
+      const decoded = Parser.decodeBase64Utf8(fmB64);
+      if (decoded) session.dynamicFirstMessage = decoded;
+    }
+
+    if (preloadedContact) {
+      session.preloadedContact = session.preloadedContact || {};
+      session.preloadedContact.name = preloadedContact;
+      session.preloadedContact.safeName = BusinessNameDetector.getSafeContactName(preloadedContact);
+    }
+
+    session.skipGreeting = skipGreeting;
+
+    // ==================== PREWARM REUSE ====================
+    let prewarmSession = prepId ? prewarmSessions.get(prepId) : null;
+
+    if (prewarmSession && (forceNewSession || skipPrewarm)) {
+      logger.info("Force destroy prewarm", { forceNew: forceNewSession, skipPrewarm });
+      if (prewarmSession.openaiWs?.readyState === WebSocket.OPEN) prewarmSession.openaiWs.close(1000, "force_new_session");
+      prewarmSessions.delete(prepId);
+      prewarmSession = null;
+    }
+
+    if (prewarmSession && prewarmSession.sessionReady) {
+      logger.info("Reusing prewarm", { prepId, ageMs: Date.now() - prewarmSession.createdAt });
+
+      session.openaiWs = prewarmSession.openaiWs;
+      session.config = prewarmSession.config;
+      session.configReady = true;
+      session.sessionCreated = prewarmSession.sessionCreated;
+      session.sessionReady = prewarmSession.sessionReady;
+
+      // CRITICAL: Prewarm override check
+      let needsSessionRefresh = false;
+      const effectiveMode = session.dynamicInstructionsMode || prewarmSession.dynamicInstructionsMode || "addon";
+
+      if (session.dynamicInstructions && (effectiveMode === "full" || effectiveMode === "replace")) {
+        logger.info("Prewarm override: replacing prompt", { mode: effectiveMode });
+        session.dynamicInstructionsMode = "full";
+        needsSessionRefresh = true;
+      } else {
+        session.dynamicInstructions = session.dynamicInstructions || prewarmSession.dynamicInstructions;
+        session.dynamicInstructionsMode = effectiveMode;
+      }
+
+      session.dynamicFirstMessage = session.dynamicFirstMessage || prewarmSession.firstMessage || prewarmSession.prepFirstMessage;
+      session.preloadedContact = session.preloadedContact || prewarmSession.preloadedContact;
+      session.isDemoCall = prewarmSession.isDemoCall;
+      session.language = session.language || prewarmSession.language;
+      session.greetingMessageSent = false;
+
+      prewarmSessions.delete(prepId);
+
+      // Re-bind OpenAI handler to this session
+      OpenAIHandler.setupMessageHandler(session);
+
+      if (needsSessionRefresh) {
+        logger.info("Sending session.update with NEW instructions (prewarm override)");
+        OpenAIHandler.sendSessionUpdate(session);
+      }
+    } else {
+      // ==================== COLD START ====================
+      logger.info("Cold start â€” no prewarm", { callSid: session.callSid });
+      if (prepId) await SupabaseClient.loadPrepSession(prepId, session);
+      const config = await SupabaseClient.loadAgentConfig(session.agentId, session.companyId);
+      session.config = config;
+      session.configReady = true;
+    }
+
+    // Register session by callSid and create call record
+    sessions.set(session.callSid, session);
+    this._createCallRecord(session);
+    this.startRingback(session);
+    session.metrics.t_stream_start = Date.now();
+
+    if (!session.openaiWs || session.openaiWs.readyState !== WebSocket.OPEN) {
+      await OpenAIHandler.connect(session);
+    } else {
+      this.tryTriggerGreetingWhenReady(session);
+    }
+  }
+
+  static async _handleStop(session) {
+    logger.info("Twilio stream stopped", { callSid: session.callSid });
+    session.metrics.t_call_ended = Date.now();
+
+    if (session.openaiWs?.readyState === WebSocket.OPEN) {
+      session.openaiWs.close(1000, "stream_stopped");
+    }
+
+    // Send webhook if configured
+    if (session.config?.webhook_url) {
+      await WebhookClient.send(session.config.webhook_url, {
+        event: "call_ended",
+        call_sid: session.callSid,
+        duration_ms: session.metrics.t_call_ended - session.metrics.t_session_created,
+        transcripts: session.transcripts
+      });
+    }
+  }
+
+  // ==================== GREETING SYSTEM ====================
+
+  static tryTriggerGreetingWhenReady(session) {
+    if (session.greetingTriggered || session.callEnding) return;
+    if (!session.twilioStreamReady || !session.sessionCreated || session.pendingSessionUpdate || !session.sessionReady) return;
+    this._triggerGreeting(session);
+  }
+
+  static _triggerGreeting(session) {
+    if (session.greetingTriggered) return;
+    session.greetingTriggered = true;
+    this.stopRingback(session);
+
+    const safeName = session.preloadedContact ? BusinessNameDetector.getSafeContactName(session.preloadedContact.name) : null;
+    const isOutbound = session.direction === "outbound";
+
+    if (isOutbound) {
+      let greeting = session.dynamicFirstMessage || session.config?.firstMessage;
+
+      // Generate generic greeting if contact name is a business name
+      if (greeting && session.preloadedContact && !safeName) {
+        const agentName = session.config?.companyName ? "" : "un representante";
+        const company = session.config?.companyName || "";
+        greeting = session.language === "en"
+          ? `Hello! This is ${agentName || "a representative"}${company ? " from " + company : ""}. Do you have a moment to talk?`
+          : `\u00A1Hola! Soy ${agentName || "un representante"}${company ? " de " + company : ""}. \u00BFTiene un momento para hablar?`;
+      }
+
+      if (greeting) {
+        logger.info("Outbound greeting", { callSid: session.callSid, greeting: greeting.substring(0, 80) });
+        session.openaiWs.send(JSON.stringify({
+          type: "conversation.item.create",
+          item: { type: "message", role: "user", content: [{ type: "input_text", text: "[CALL CONNECTED - Customer answered. Deliver your opening greeting NOW.]" }] }
+        }));
+        ResponseLockManager.sendResponseCreateSafe(session, {
+          type: "response.create",
+          response: { modalities: ["text", "audio"], instructions: `Say exactly: "${greeting}"` }
+        }, "outbound_greeting");
+      } else {
+        session.openaiWs.send(JSON.stringify({
+          type: "conversation.item.create",
+          item: { type: "message", role: "user", content: [{ type: "input_text", text: "[CALL CONNECTED - Customer answered. Deliver your opening greeting NOW.]" }] }
+        }));
+        ResponseLockManager.sendResponseCreateSafe(session, {
+          type: "response.create", response: { modalities: ["text", "audio"] }
+        }, "outbound_generic");
+      }
+    } else {
+      // Inbound
+      let greeting = session.dynamicFirstMessage || session.config?.firstMessage;
+
+      if (greeting && session.preloadedContact && !safeName) {
+        const company = session.config?.companyName || "";
+        greeting = session.language === "en"
+          ? `Hello! Thank you for calling${company ? " " + company : ""}. How can I help you today?`
+          : `\u00A1Hola! Gracias por llamar${company ? " a " + company : ""}. \u00BFEn qu\u00E9 puedo ayudarle hoy?`;
+      }
+
+      if (greeting) {
+        logger.info("Inbound greeting", { callSid: session.callSid, greeting: greeting.substring(0, 80) });
+        session.openaiWs.send(JSON.stringify({
+          type: "conversation.item.create",
+          item: { type: "message", role: "user", content: [{ type: "input_text", text: "[CALL STARTED - Customer is calling in. Greet them immediately.]" }] }
+        }));
+        ResponseLockManager.sendResponseCreateSafe(session, {
+          type: "response.create",
+          response: { modalities: ["text", "audio"], instructions: `Say exactly: "${greeting}"` }
+        }, "inbound_greeting");
+      } else {
+        session.openaiWs.send(JSON.stringify({
+          type: "conversation.item.create",
+          item: { type: "message", role: "user", content: [{ type: "input_text", text: "[CALL STARTED - Customer is calling in. Greet them now.]" }] }
+        }));
+        ResponseLockManager.sendResponseCreateSafe(session, {
+          type: "response.create", response: { modalities: ["text", "audio"] }
+        }, "inbound_generic");
+      }
+    }
+  }
+
+  // ==================== RINGBACK ====================
+
+  static startRingback(session) {
+    if (session.ringbackInterval) return;
+    session.ringbackFrames = 0;
+    session.ringbackInterval = setInterval(() => {
+      if (session.twilioWs?.readyState === WebSocket.OPEN && session.streamSid) {
+        session.twilioWs.send(JSON.stringify({
+          event: "media", streamSid: session.streamSid,
+          media: { payload: RINGBACK_SILENCE_FRAME }
+        }));
+        session.ringbackFrames++;
+      }
+    }, RINGBACK_INTERVAL_MS);
+
+    // Safety: stop after 10 seconds
+    setTimeout(() => this.stopRingback(session), 10000);
+  }
+
+  static stopRingback(session) {
+    if (!session.ringbackInterval) return;
+    clearInterval(session.ringbackInterval);
+    session.ringbackInterval = null;
+    logger.debug("Ringback stopped", { callSid: session.callSid, frames: session.ringbackFrames });
+    if (session.twilioWs?.readyState === WebSocket.OPEN && session.streamSid) {
+      session.twilioWs.send(JSON.stringify({ event: "clear", streamSid: session.streamSid }));
+    }
+  }
+
+  // ==================== CALL RECORD ====================
+
+  static async _createCallRecord(session) {
+    try {
+      const res = await fetch(UPSERT_CALL_RECORD_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}` },
+        body: JSON.stringify({
+          twilio_call_sid: session.callSid,
+          agent_id: session.agentId,
+          company_id: session.companyId,
+          from_number: session.fromNumber,
+          to_number: session.toNumber,
+          direction: session.direction,
+          status: "in-progress"
+        })
+      });
+      const result = Parser.safeJsonParse(await res.text(), null);
+      if (res.ok && result?.success) {
+        session.callDbId = result.id;
+        logger.info("Call record upserted", { callSid: session.callSid, id: result.id });
+      }
+    } catch (e) {
+      logger.error("Call record error", { callSid: session.callSid, error: e.message });
+    }
+  }
+}
+
+
+// ============================================================
+// SECTION 9: OBSERVABILITY
+// ============================================================
+
+/**
+ * MetricsCollector - Collect and expose metrics
+ */
+class MetricsCollector {
+  static getMetrics() {
+    if (!ENABLE_METRICS) return { enabled: false };
+
+    const tenantStats = [];
+    for (const [companyId, counts] of tenantCallCounts.entries()) {
+      tenantStats.push({ companyId, concurrent: counts.concurrent, hourly: counts.hourly.length });
+    }
+
+    return {
+      version: VERSION,
+      timestamp: new Date().toISOString(),
+      uptime_seconds: Math.floor(process.uptime()),
+      sessions: { active: SessionManager.getActiveSessionCount(), prewarm: SessionManager.getPrewarmSessionCount() },
+      circuits: [supabaseCircuit.getState(), openaiCircuit.getState(), crmToolsCircuit.getState()],
+      tenants: tenantStats.slice(0, 10),
+      memory: {
+        used_mb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+        total_mb: Math.round(process.memoryUsage().heapTotal / 1024 / 1024)
+      }
+    };
+  }
+}
+
+/**
+ * HealthCheck - Service health checks
+ */
+class HealthCheck {
+  static async check() {
+    const checks = { version: VERSION, timestamp: new Date().toISOString(), status: "healthy", services: {} };
+
+    try {
+      const res = await SupabaseClient.request("agents_new?limit=1", "GET");
+      checks.services.supabase = { status: res.ok ? "healthy" : "unhealthy", circuit: supabaseCircuit.getState().state };
+    } catch (error) {
+      checks.services.supabase = { status: "unhealthy", error: error.message, circuit: supabaseCircuit.getState().state };
+      checks.status = "degraded";
+    }
+
+    checks.services.openai = {
+      status: openaiCircuit.getState().state === "OPEN" ? "unhealthy" : "healthy",
+      circuit: openaiCircuit.getState().state
+    };
+    checks.services.crm_tools = {
+      status: crmToolsCircuit.getState().state === "OPEN" ? "unhealthy" : "healthy",
+      circuit: crmToolsCircuit.getState().state
+    };
+
+    const unhealthyServices = Object.values(checks.services).filter(s => s.status === "unhealthy");
+    if (unhealthyServices.length > 0) {
+      checks.status = unhealthyServices.length === Object.keys(checks.services).length ? "unhealthy" : "degraded";
+    }
+
+    return checks;
+  }
+}
+
+
+// ============================================================
+// SECTION 10: SERVER
+// ============================================================
+
+/**
+ * HTTP Server with WebSocket support
+ */
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const path = url.pathname;
+
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+  if (req.method === "OPTIONS") { res.writeHead(200); res.end(); return; }
+
+  // Rate limiting by IP
+  const clientIp = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+  const ipLimit = RateLimiter.checkIPLimit(clientIp);
+  if (!ipLimit.allowed) {
+    res.writeHead(429, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Rate limit exceeded", limit: ipLimit.limit }));
     return;
   }
 
-  res.writeHead(404, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ ok: false, error: "Not found", path: req.url }));
+  try {
+    // GET / â€” Basic info
+    if (path === "/" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ service: "Voice Gateway", version: VERSION, status: "running" }));
+      return;
+    }
+
+    // GET /health
+    if (path === "/health" && req.method === "GET") {
+      const health = await HealthCheck.check();
+      const statusCode = health.status === "unhealthy" ? 503 : 200;
+      res.writeHead(statusCode, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        ...health,
+        activeSessions: SessionManager.getActiveSessionCount(),
+        prewarmSessions: SessionManager.getPrewarmSessionCount()
+      }));
+      return;
+    }
+
+    // GET /metrics
+    if (path === "/metrics" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(MetricsCollector.getMetrics()));
+      return;
+    }
+
+    // GET /sessions (protected)
+    if (path === "/sessions" && req.method === "GET") {
+      if (VOICE_GATEWAY_TOKEN && req.headers.authorization !== `Bearer ${VOICE_GATEWAY_TOKEN}`) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized" }));
+        return;
+      }
+      const sessionList = [];
+      for (const [sessionId, session] of sessions.entries()) {
+        sessionList.push({
+          session_id: sessionId, call_sid: session.callSid,
+          company_id: session.companyId, agent_id: session.agentId,
+          direction: session.direction, language: session.language,
+          created_at: new Date(session.createdAt).toISOString(),
+          duration_ms: Date.now() - session.createdAt
+        });
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ count: sessionList.length, sessions: sessionList }));
+      return;
+    }
+
+    // POST /prewarm (protected)
+    if (path === "/prewarm" && req.method === "POST") {
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", async () => {
+        try {
+          if (VOICE_GATEWAY_TOKEN && req.headers.authorization !== `Bearer ${VOICE_GATEWAY_TOKEN}`) {
+            res.writeHead(401, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Unauthorized" }));
+            return;
+          }
+
+          const data = JSON.parse(body);
+          const prewarmStart = Date.now();
+
+          if (!Validator.isValidUUID(data.agent_id) || !Validator.isValidUUID(data.company_id)) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Invalid agent_id or company_id" }));
+            return;
+          }
+
+          const config = await SupabaseClient.loadAgentConfig(data.agent_id, data.company_id);
+          const prepId = data.prep_id || generatePrepId();
+
+          // Create a temporary session for prewarm
+          const session = {
+            sessionId: prepId,
+            prepId,
+            agentId: data.agent_id,
+            companyId: data.company_id,
+            config,
+            configReady: true,
+            direction: data.direction || "outbound",
+            fromNumber: data.from_number || data.from || "",
+            toNumber: data.to_number || data.to || "",
+            customerPhone: (data.direction || "outbound") === "outbound" ? (data.to_number || data.to || "") : (data.from_number || data.from || ""),
+            language: data.language || data.contact_language || DEFAULT_LANGUAGE,
+            dynamicInstructions: data.dynamic_instructions || null,
+            dynamicInstructionsMode: data.dynamic_instructions_mode || data.dynamicInstructionsMode || "addon",
+            firstMessage: data.first_message || null,
+            prepFirstMessage: data.first_message || null,
+            isDemoCall: data.is_demo === true,
+            transcripts: { user: [], assistant: [] },
+            toolCalls: [],
+            sessionCreated: false,
+            sessionReady: false,
+            greetingMessageSent: false,
+            greetingTriggered: false,
+            callEnding: false,
+            voicemailHandled: false,
+            firstAudioSent: false,
+            pendingSessionUpdate: false,
+            responseLock: { isLocked: false, lockedBy: null, lockedAt: null },
+            metrics: { t_session_created: Date.now() },
+            createdAt: Date.now()
+          };
+
+          if (data.contact_name) {
+            session.preloadedContact = {
+              name: data.contact_name,
+              safeName: BusinessNameDetector.getSafeContactName(data.contact_name),
+              email: data.contact_email || null,
+              language: data.contact_language || DEFAULT_LANGUAGE
+            };
+          }
+
+          // Connect to OpenAI for prewarm
+          await OpenAIHandler.connect(session);
+
+          let responded = false;
+
+          // Listen for session.updated to confirm prewarm is ready
+          const originalHandler = session.openaiWs.listeners("message").pop();
+          session.openaiWs.on("message", (msgData) => {
+            const event = Parser.safeJsonParse(msgData.toString(), null);
+            if (!event) return;
+
+            if (event.type === "session.created") {
+              session.sessionCreated = true;
+              OpenAIHandler.sendSessionUpdate(session);
+            }
+
+            if (event.type === "session.updated" && !responded) {
+              session.sessionReady = true;
+              responded = true;
+              prewarmSessions.set(prepId, session);
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({
+                success: true,
+                prep_id: prepId,
+                session_ready: true,
+                timing_ms: Date.now() - prewarmStart
+              }));
+            }
+          });
+
+          // Timeout fallback
+          setTimeout(() => {
+            if (!responded) {
+              responded = true;
+              prewarmSessions.set(prepId, session);
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({
+                success: true,
+                prep_id: prepId,
+                session_ready: false,
+                note: "Timeout â€” stored but not fully ready"
+              }));
+            }
+          }, SESSION_UPDATE_TIMEOUT_MS);
+
+        } catch (error) {
+          logger.error("Prewarm API error", { error: error.message });
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: error.message }));
+        }
+      });
+      return;
+    }
+
+    // 404 Not Found
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Not found" }));
+  } catch (error) {
+    logger.error("HTTP request error", { path, method: req.method, error: error.message });
+    res.writeHead(500, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Internal server error" }));
+  }
 });
 
-// Upgrade to WS
-server.on("upgrade", (req, socket, head) => {
-  if (!req.url || !req.url.startsWith("/twilio-stream")) return socket.destroy();
-  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+/**
+ * WebSocket Server for Twilio Media Streams
+ */
+const wss = new WebSocketServer({ server, path: "/twilio-stream" });
+
+wss.on("connection", async (ws, request) => {
+  try {
+    await TwilioHandler.handleConnection(ws, request);
+  } catch (error) {
+    logger.error("WebSocket connection error", { error: error.message });
+    ws.close(1011, "Internal error");
+  }
 });
 
+wss.on("error", (error) => {
+  logger.error("WebSocket server error", { error: error.message });
+});
+
+/**
+ * Start server
+ */
 server.listen(PORT, () => {
-  console.log(`[START] ${VERSION} listening on ${PORT} env=${NODE_ENV} mode=${MODE}`);
-  if (!PUBLIC_BASE_URL) warn("env_missing_public_base_url", {});
-  if (!OPENAI_API_KEY) warn("env_missing_openai_key", {});
+  logger.info("Voice Gateway started", { version: VERSION, port: PORT, pid: process.pid });
+
+  console.log(`
+â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
+â•‘                                                           â•‘
+â•‘  VOICE GATEWAY v${VERSION} â€” ENTERPRISE EDITION            â•‘
+â•‘                                                           â•‘
+â•‘  ðŸš€ Server running on port ${PORT}                          â•‘
+â•‘  ðŸ“Š Metrics: http://localhost:${PORT}/metrics               â•‘
+â•‘  â¤ï¸  Health:  http://localhost:${PORT}/health                â•‘
+â•‘  ðŸ”Œ WebSocket: ws://localhost:${PORT}/twilio-stream          â•‘
+â•‘                                                           â•‘
+â•‘  Architecture: 22 OOP Classes (10 sections)               â•‘
+â•‘  âœ… Multi-tenant (agents_new + bc_agents)                 â•‘
+â•‘  âœ… Circuit breakers & exponential backoff                â•‘
+â•‘  âœ… Prewarm with forceNewSession/skipPrewarm              â•‘
+â•‘  âœ… Dynamic instructions (full/addon) + Base64            â•‘
+â•‘  âœ… Voicemail/IVR detection + auto-hangup                 â•‘
+â•‘  âœ… Spam filtering & rate limiting                        â•‘
+â•‘  âœ… Tool deduplication & response locking                 â•‘
+â•‘  âœ… Business name detection                               â•‘
+â•‘  âœ… Webhook support for post-call events                  â•‘
+â•‘  âœ… Structured JSON logging + metrics                     â•‘
+â•‘  âœ… Graceful shutdown + fatal error handling               â•‘
+â•‘  âœ… Full exports for testing                              â•‘
+â•‘                                                           â•‘
+â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+  `);
 });
+
+
+// ============================================================
+// GRACEFUL SHUTDOWN & ERROR HANDLING
+// ============================================================
+
+process.on("SIGTERM", async () => {
+  logger.info("SIGTERM received, shutting down gracefully");
+  wss.close(() => { logger.info("WebSocket server closed"); });
+  server.close(() => { logger.info("HTTP server closed"); process.exit(0); });
+  setTimeout(() => { logger.error("Forced shutdown after timeout"); process.exit(1); }, 10000);
+});
+
+process.on("SIGINT", () => { process.emit("SIGTERM"); });
+
+process.on("uncaughtException", (error) => {
+  logger.fatal("Uncaught exception", { error: error.message, stack: error.stack });
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  logger.fatal("Unhandled rejection", { reason: String(reason) });
+  process.exit(1);
+});
+
+
+// ============================================================
+// EXPORTS FOR TESTING
+// ============================================================
+
+export {
+  // Utilities
+  Logger,
+  Validator,
+  Parser,
+  // Resilience
+  RetryManager,
+  CircuitBreaker,
+  RateLimiter,
+  // State
+  SessionManager,
+  ResponseLockManager,
+  // External Services
+  SupabaseClient,
+  CRMToolsClient,
+  WebhookClient,
+  // Business Logic
+  BusinessNameDetector,
+  LanguageDetector,
+  VoicemailDetector,
+  AutoHangupManager,
+  SpamFilter,
+  ToolDeduplicator,
+  PromptBuilder,
+  VoiceMapper,
+  // Execution
+  ToolExecutor,
+  // Handlers
+  OpenAIHandler,
+  TwilioHandler,
+  // Observability
+  MetricsCollector,
+  HealthCheck
+};
