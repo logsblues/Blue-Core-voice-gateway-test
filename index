@@ -920,7 +920,7 @@ class SupabaseClient {
         if (bcRes.ok && bcRes.data?.[0]) {
           const bcAgent = bcRes.data[0];
           config.systemPrompt = bcAgent.system_prompt_base || config.systemPrompt;
-          config.voice = VoiceMapper.mapToOpenAI(bcAgent.openai_voice || bcAgent.voice_provider || DEFAULT_VOICE);
+          config.voice = VoiceMapper.mapToOpenAI(bcAgent.tts_voice || bcAgent.openai_voice || DEFAULT_VOICE);
           config.language = bcAgent.language_default || bcAgent.language || config.language;
           config.firstMessage = config.firstMessage || bcAgent.first_message;
 
