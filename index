@@ -1876,10 +1876,143 @@ class ToolExecutor {
     if (!target) return { success: false, error: "Agent not found" };
 
     try {
+      // 1. Resolve dial target from agent_profiles
       const profileRes = await SupabaseClient.request("agent_profiles?agent_id=eq." + target.id + "&select=dial_target,phone");
       const dialTarget = profileRes.ok && profileRes.data?.[0] ? (profileRes.data[0].dial_target || profileRes.data[0].phone) : null;
       if (!dialTarget) return { success: false, error: "No phone for " + target.name };
+
+      // 2. Resolve Twilio credentials for this company (subaccount → master fallback)
+      let twilioSid = process.env.TWILIO_ACCOUNT_SID;
+      let twilioToken = process.env.TWILIO_AUTH_TOKEN;
+
+      if (session.companyId) {
+        try {
+          // Try bc_communications_settings first
+          const bcCommRes = await SupabaseClient.request(
+            "bc_communications_settings?company_id=eq." + session.companyId +
+            "&select=twilio_subaccount_sid,twilio_subaccount_auth_token,twilio_account_sid,twilio_auth_token"
+          );
+          const bcComm = bcCommRes.ok && bcCommRes.data?.[0];
+          if (bcComm?.twilio_subaccount_sid && bcComm?.twilio_subaccount_auth_token) {
+            twilioSid = bcComm.twilio_subaccount_sid;
+            twilioToken = bcComm.twilio_subaccount_auth_token;
+            logger.info("Transfer using BC subaccount creds", { callSid: session.callSid });
+          } else if (bcComm?.twilio_account_sid && bcComm?.twilio_auth_token) {
+            twilioSid = bcComm.twilio_account_sid;
+            twilioToken = bcComm.twilio_auth_token;
+            logger.info("Transfer using BC account creds", { callSid: session.callSid });
+          } else {
+            // Fallback to communications_settings (production table)
+            const commRes = await SupabaseClient.request(
+              "communications_settings?company_id=eq." + session.companyId +
+              "&select=twilio_subaccount_sid,twilio_subaccount_auth_token"
+            );
+            const comm = commRes.ok && commRes.data?.[0];
+            if (comm?.twilio_subaccount_sid && comm?.twilio_subaccount_auth_token) {
+              twilioSid = comm.twilio_subaccount_sid;
+              twilioToken = comm.twilio_subaccount_auth_token;
+              logger.info("Transfer using prod subaccount creds", { callSid: session.callSid });
+            } else {
+              logger.info("Transfer using master env creds", { callSid: session.callSid });
+            }
+          }
+        } catch (credErr) {
+          logger.warn("Failed to fetch company Twilio creds, using master", { error: credErr.message });
+        }
+      }
+
+      if (!twilioSid || !twilioToken) {
+        return { success: false, error: "Twilio credentials not available for transfer" };
+      }
+
+      // 3. Tell the AI to announce the transfer
+      if (session.openaiWs?.readyState === WebSocket.OPEN) {
+        session.openaiWs.send(JSON.stringify({
+          type: "conversation.item.create",
+          item: {
+            type: "message", role: "system",
+            content: [{ type: "input_text", text: `[TRANSFER] Say exactly: "Transferring your call to ${target.name}, please hold." – Do NOT say anything else after this.` }]
+          }
+        }));
+        ResponseLockManager.sendResponseCreateSafe(
+          session,
+          { type: "response.create", response: { modalities: ["text", "audio"] } },
+          "transfer_announce"
+        );
+      }
+
+      // 4. Mark session as ending to prevent further AI responses
+      session.callEnding = true;
+
+      // 5. Execute Twilio redirect after delay for AI announcement
+      setTimeout(async () => {
+        try {
+          const twiml = `<Response><Say voice="Polly.Lupe-Neural" language="es-US">Transfiriendo su llamada a ${target.name}. Por favor espere.</Say><Dial timeout="30"><Number>${dialTarget}</Number></Dial><Say voice="Polly.Lupe-Neural" language="es-US">No pudimos completar la transferencia. Intente más tarde.</Say><Hangup/></Response>`;
+
+          const twilioUrl = `https://api.twilio.com/2010-04-01/Accounts/${twilioSid}/Calls/${session.callSid}.json`;
+          const authHeader = "Basic " + Buffer.from(`${twilioSid}:${twilioToken}`).toString("base64");
+
+          logger.info("Executing Twilio transfer redirect", {
+            callSid: session.callSid,
+            dialTarget,
+            agentName: target.name,
+            twilioAccount: twilioSid.substring(0, 10) + "..."
+          });
+
+          const twilioRes = await fetch(twilioUrl, {
+            method: "POST",
+            headers: {
+              "Authorization": authHeader,
+              "Content-Type": "application/x-www-form-urlencoded"
+            },
+            body: new URLSearchParams({ Twiml: twiml }).toString()
+          });
+
+          if (!twilioRes.ok) {
+            const errText = await twilioRes.text();
+            logger.error("Twilio transfer redirect FAILED", {
+              callSid: session.callSid,
+              status: twilioRes.status,
+              error: errText
+            });
+          } else {
+            logger.info("Twilio transfer redirect SUCCESS", {
+              callSid: session.callSid,
+              dialTarget,
+              agentName: target.name
+            });
+          }
+
+          // 6. Update agent status to busy (non-critical)
+          try {
+            await SupabaseClient.request("agents_new?id=eq." + target.id, "PATCH", { availability: "busy" });
+          } catch (e) { /* non-critical */ }
+
+          // 7. Update call record (non-critical)
+          try {
+            await SupabaseClient.request("calls?call_sid=eq." + session.callSid, "PATCH", {
+              transferred_to_agent_id: target.id,
+              call_state: "transferred"
+            });
+          } catch (e) { /* non-critical */ }
+
+          // 8. Close OpenAI WebSocket after redirect takes effect
+          setTimeout(() => {
+            if (session.openaiWs?.readyState === WebSocket.OPEN) {
+              session.openaiWs.close(1000, "transfer");
+            }
+          }, 2000);
+
+        } catch (transferErr) {
+          logger.error("Transfer execution error", {
+            callSid: session.callSid,
+            error: transferErr.message
+          });
+        }
+      }, 2500); // Wait 2.5s for AI announcement before Twilio redirect
+
       return { success: true, transfer_to: dialTarget, agent_name: target.name, action: "transfer" };
+
     } catch (e) {
       return { success: false, error: e.message };
     }
