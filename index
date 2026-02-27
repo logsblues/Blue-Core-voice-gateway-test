@@ -1868,6 +1868,69 @@ class ToolExecutor {
     return { success: true, message: "Call ended" };
   }
 
+  static async _resolveTwilioTokenForOwner(session) {
+    const ownerSid = session.twilioOwnerSid;
+    if (!ownerSid) {
+      logger.warn("No twilioOwnerSid in session, falling back to env", { callSid: session.callSid });
+      return process.env.TWILIO_AUTH_TOKEN || null;
+    }
+
+    // 1) If ownerSid matches master env → use master token
+    if (ownerSid === process.env.TWILIO_ACCOUNT_SID) {
+      logger.info("Owner matches master env SID", { callSid: session.callSid });
+      return process.env.TWILIO_AUTH_TOKEN;
+    }
+
+    // 2) Look up token from bc_communications_settings
+    if (session.companyId) {
+      try {
+        const bcRes = await SupabaseClient.request(
+          "bc_communications_settings?company_id=eq." + session.companyId +
+          "&select=twilio_subaccount_sid,twilio_subaccount_auth_token,twilio_account_sid,twilio_auth_token"
+        );
+        const bc = bcRes.ok && bcRes.data?.[0];
+
+        if (bc?.twilio_subaccount_sid === ownerSid && bc?.twilio_subaccount_auth_token) {
+          logger.info("Resolved token from bc_communications_settings (subaccount)", { callSid: session.callSid });
+          return bc.twilio_subaccount_auth_token;
+        }
+        if (bc?.twilio_account_sid === ownerSid && bc?.twilio_auth_token) {
+          logger.info("Resolved token from bc_communications_settings (account)", { callSid: session.callSid });
+          return bc.twilio_auth_token;
+        }
+      } catch (e) {
+        logger.warn("Failed to query bc_communications_settings for token", { error: e.message });
+      }
+
+      // 3) Fallback to communications_settings (production table)
+      try {
+        const prodRes = await SupabaseClient.request(
+          "communications_settings?company_id=eq." + session.companyId +
+          "&select=subaccount_sid,twilio_subaccount_auth_token,twilio_account_sid,twilio_auth_token"
+        );
+        const prod = prodRes.ok && prodRes.data?.[0];
+
+        if (prod?.subaccount_sid === ownerSid && prod?.twilio_subaccount_auth_token) {
+          logger.info("Resolved token from communications_settings (subaccount)", { callSid: session.callSid });
+          return prod.twilio_subaccount_auth_token;
+        }
+        if (prod?.twilio_account_sid === ownerSid && prod?.twilio_auth_token) {
+          logger.info("Resolved token from communications_settings (account)", { callSid: session.callSid });
+          return prod.twilio_auth_token;
+        }
+      } catch (e) {
+        logger.warn("Failed to query communications_settings for token", { error: e.message });
+      }
+    }
+
+    // 4) Last resort: try master token anyway (master can operate on subaccount calls)
+    logger.warn("Could not resolve specific token for owner, trying master as last resort", {
+      callSid: session.callSid,
+      ownerSid: ownerSid.substring(0, 12) + "..."
+    });
+    return process.env.TWILIO_AUTH_TOKEN || null;
+  }
+
   static async _executeTransfer(session, args) {
     if (!session.config?.humanAgents?.length) return { success: false, error: "No human agents available" };
     const name = args.agent_name || args.agentName || args.reason;
@@ -1881,48 +1944,17 @@ class ToolExecutor {
       const dialTarget = profileRes.ok && profileRes.data?.[0] ? (profileRes.data[0].dial_target || profileRes.data[0].phone) : null;
       if (!dialTarget) return { success: false, error: "No phone for " + target.name };
 
-      // 2. Resolve Twilio credentials for this company (subaccount → master fallback)
-      let twilioSid = process.env.TWILIO_ACCOUNT_SID;
-      let twilioToken = process.env.TWILIO_AUTH_TOKEN;
+      // 2. Resolve Twilio credentials using OWNER SID (not env vars)
+      const twilioSid = session.twilioOwnerSid || process.env.TWILIO_ACCOUNT_SID;
+      let twilioToken = session.twilioOwnerToken;
 
-      if (session.companyId) {
-        try {
-          // Try bc_communications_settings first
-          const bcCommRes = await SupabaseClient.request(
-            "bc_communications_settings?company_id=eq." + session.companyId +
-            "&select=twilio_subaccount_sid,twilio_subaccount_auth_token,twilio_account_sid,twilio_auth_token"
-          );
-          const bcComm = bcCommRes.ok && bcCommRes.data?.[0];
-          if (bcComm?.twilio_subaccount_sid && bcComm?.twilio_subaccount_auth_token) {
-            twilioSid = bcComm.twilio_subaccount_sid;
-            twilioToken = bcComm.twilio_subaccount_auth_token;
-            logger.info("Transfer using BC subaccount creds", { callSid: session.callSid });
-          } else if (bcComm?.twilio_account_sid && bcComm?.twilio_auth_token) {
-            twilioSid = bcComm.twilio_account_sid;
-            twilioToken = bcComm.twilio_auth_token;
-            logger.info("Transfer using BC account creds", { callSid: session.callSid });
-          } else {
-            // Fallback to communications_settings (production table)
-            const commRes = await SupabaseClient.request(
-              "communications_settings?company_id=eq." + session.companyId +
-              "&select=twilio_subaccount_sid,twilio_subaccount_auth_token"
-            );
-            const comm = commRes.ok && commRes.data?.[0];
-            if (comm?.twilio_subaccount_sid && comm?.twilio_subaccount_auth_token) {
-              twilioSid = comm.twilio_subaccount_sid;
-              twilioToken = comm.twilio_subaccount_auth_token;
-              logger.info("Transfer using prod subaccount creds", { callSid: session.callSid });
-            } else {
-              logger.info("Transfer using master env creds", { callSid: session.callSid });
-            }
-          }
-        } catch (credErr) {
-          logger.warn("Failed to fetch company Twilio creds, using master", { error: credErr.message });
-        }
+      // If token wasn't pre-resolved, resolve now
+      if (!twilioToken) {
+        twilioToken = await this._resolveTwilioTokenForOwner(session);
       }
 
       if (!twilioSid || !twilioToken) {
-        return { success: false, error: "Twilio credentials not available for transfer" };
+        return { success: false, error: "Twilio credentials not available for transfer (owner: " + (twilioSid?.substring(0, 12) || "none") + ")" };
       }
 
       // 3. Tell the AI to announce the transfer
@@ -1949,6 +1981,7 @@ class ToolExecutor {
         try {
           const twiml = `<Response><Say voice="Polly.Lupe-Neural" language="es-US">Transfiriendo su llamada a ${target.name}. Por favor espere.</Say><Dial timeout="30"><Number>${dialTarget}</Number></Dial><Say voice="Polly.Lupe-Neural" language="es-US">No pudimos completar la transferencia. Intente más tarde.</Say><Hangup/></Response>`;
 
+          // CRITICAL: Use twilioSid (owner of the call), NOT env var
           const twilioUrl = `https://api.twilio.com/2010-04-01/Accounts/${twilioSid}/Calls/${session.callSid}.json`;
           const authHeader = "Basic " + Buffer.from(`${twilioSid}:${twilioToken}`).toString("base64");
 
@@ -1956,7 +1989,8 @@ class ToolExecutor {
             callSid: session.callSid,
             dialTarget,
             agentName: target.name,
-            twilioAccount: twilioSid.substring(0, 10) + "..."
+            ownerSid: twilioSid.substring(0, 12) + "...",
+            ownerMatchesEnv: twilioSid === process.env.TWILIO_ACCOUNT_SID
           });
 
           const twilioRes = await fetch(twilioUrl, {
@@ -1973,7 +2007,8 @@ class ToolExecutor {
             logger.error("Twilio transfer redirect FAILED", {
               callSid: session.callSid,
               status: twilioRes.status,
-              error: errText
+              error: errText,
+              usedSid: twilioSid.substring(0, 12) + "..."
             });
           } else {
             logger.info("Twilio transfer redirect SUCCESS", {
@@ -2457,6 +2492,7 @@ class TwilioHandler {
   static async _handleStart(session, message, urlParams) {
     session.streamSid = message.streamSid;
     session.callSid = message.start.callSid;
+    session.twilioOwnerSid = message.start.accountSid || null;
     const params = message.start.customParameters || {};
 
     // Extract phones
@@ -2597,6 +2633,9 @@ class TwilioHandler {
       session.config = config;
       session.configReady = true;
     }
+
+    // Pre-resolve Twilio owner token for transfer (fix 404)
+    session.twilioOwnerToken = await ToolExecutor._resolveTwilioTokenForOwner(session);
 
     // NEW v7: Load dynamic tools and playbook
     const dynamicTools = await DynamicToolLoader.loadTools(session.agentId);
