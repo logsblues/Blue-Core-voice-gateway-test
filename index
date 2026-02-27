@@ -1826,9 +1826,8 @@ class ToolExecutor {
   }
 
   static async execute(session, toolName, callId, args) {
-    // ✅ FIX BUG-2: Allow transfer_to_human even when callEnding is active
-    const ALLOWED_DURING_END = ["transfer_to_human"];
-    if (session.callEnding && !ALLOWED_DURING_END.includes(toolName)) {
+    // ✅ FIX BUG-2: Allow transfer_to_human even if callEnding is active (race condition guard)
+    if (session.callEnding && toolName !== "transfer_to_human") {
       logger.debug("Tool blocked (call ending)", { toolName, callSid: session.callSid });
       return;
     }
