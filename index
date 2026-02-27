@@ -2101,7 +2101,7 @@ class ToolExecutor {
     }
   }
 
-    static async _executeLookup(session, args) {
+  static async _executeLookup(session, args) {
     if (session.preloadedContact) return { found: true, contact: session.preloadedContact, source: "preloaded" };
     const phone = this.getCustomerPhone(session, args);
     try {
