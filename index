@@ -80,7 +80,7 @@ import http from "http";
 // SECTION 1: CONFIGURATION & CONSTANTS
 // ============================================================
 
-const VERSION = "7.2.3";
+const VERSION = "7.2.4";
 const PORT = process.env.PORT || 10000;
 
 // Environment variables (required)
@@ -1816,6 +1816,86 @@ class VoiceMapper {
  * ToolExecutor - Execute tools with deduplication, metrics, logging, and response routing
  * ENHANCED v7: Adds ToolCallLogger.record() and uses dynamic tool schemas
  */
+// ============================================================
+// AGENT ROUTER — Transfer target resolution via edge function
+// ============================================================
+
+/**
+ * Resolve the best available human agent via the agent-router edge function.
+ * Returns { dialTarget, agentName, agentId, lockId } or null if unavailable.
+ */
+async function resolveTransferTarget(session, args) {
+  const companyId = session.companyId;
+  const callSid = session.callSid || session.twilioCallSid;
+  const agentName = args?.agent_name || args?.agentName || session.transferAgentName || null;
+
+  if (!companyId || !callSid) {
+    logger.warn("[TRANSFER] Missing companyId/callSid", { companyId, callSid });
+    return null;
+  }
+
+  logger.info("[TRANSFER] Calling agent-router", { companyId, callSid, agentName });
+
+  try {
+    const resp = await fetch(`${SUPABASE_URL}/functions/v1/agent-router`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
+      },
+      body: JSON.stringify({
+        action: "claim",
+        company_id: companyId,
+        call_sid: callSid,
+        preferred_agent_name: agentName,
+      }),
+    });
+
+    const result = await resp.json().catch(() => ({}));
+    logger.info("[TRANSFER] agent-router result", {
+      ok: resp.ok,
+      success: result?.success,
+      agent: result?.agent_name,
+      dial: result?.dial_target,
+      reason: result?.reason,
+    });
+
+    if (!resp.ok || !result?.success || !result?.dial_target) return null;
+
+    return {
+      dialTarget: result.dial_target,
+      agentName: result.agent_name,
+      agentId: result.agent_id,
+      lockId: result.lock_id,
+    };
+  } catch (e) {
+    logger.error("[TRANSFER] agent-router fetch error", { callSid, error: e.message });
+    return null;
+  }
+}
+
+/**
+ * Release the agent lock when the call ends (fire-and-forget).
+ */
+async function releaseAgentOnCallEnd(session) {
+  const callSid = session.callSid || session.twilioCallSid;
+  const companyId = session.companyId;
+  if (!callSid || !companyId) return;
+  try {
+    await fetch(`${SUPABASE_URL}/functions/v1/agent-router`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
+      },
+      body: JSON.stringify({ action: "release", company_id: companyId, call_sid: callSid }),
+    });
+    logger.info("[CLEANUP] Released agent lock", { callSid });
+  } catch (e) {
+    logger.warn("[CLEANUP] Release failed", { callSid, error: String(e) });
+  }
+}
+
 class ToolExecutor {
   static getCustomerPhone(session, args) {
     const phone = args.phone || session.customerPhone ||
@@ -2003,52 +2083,40 @@ class ToolExecutor {
     }
     session.transferInProgress = true;
 
-    if (!session.config?.humanAgents?.length) {
-      session.transferInProgress = false;
-      return { success: false, error: "No human agents available" };
-    }
-
-    const name = args.agent_name || args.agentName || args.reason;
-    let target = name ? session.config.humanAgents.find(a => a.name.toLowerCase().includes(name.toLowerCase())) : null;
-    if (!target) target = session.config.humanAgents[0];
-    if (!target) {
-      session.transferInProgress = false;
-      return { success: false, error: "Agent not found" };
-    }
-
     try {
-      // 1. Resolve dial target from agent_profiles
-      const profileRes = await SupabaseClient.request("agent_profiles?agent_id=eq." + target.id + "&select=dial_target,phone");
-      const dialTarget = profileRes.ok && profileRes.data?.[0] ? (profileRes.data[0].dial_target || profileRes.data[0].phone) : null;
-      if (!dialTarget) {
+      // 1. Resolve target via agent-router edge function (availability-aware)
+      const target = await resolveTransferTarget(session, args);
+      if (!target) {
         session.transferInProgress = false;
-        return { success: false, error: "No phone for " + target.name };
+        logger.warn("Transfer: no available agent found via agent-router", { callSid: session.callSid });
+        return { success: false, error: "No available agent found" };
       }
+
+      const { dialTarget, agentName, agentId, lockId } = target;
+      // Store lockId so releaseAgentOnCallEnd can release it
+      session.transferLockId = lockId;
+      session.transferAgentId = agentId;
 
       // 2. Resolve Twilio credentials using OWNER SID (not env vars)
       const twilioSid = session.twilioOwnerSid || process.env.TWILIO_ACCOUNT_SID;
       let twilioToken = session.twilioOwnerToken;
-
-      // If token wasn't pre-resolved, resolve now
       if (!twilioToken) {
         twilioToken = await this._resolveTwilioTokenForOwner(session);
       }
-
       if (!twilioSid || !twilioToken) {
         session.transferInProgress = false;
         return { success: false, error: "Twilio credentials not available for transfer (owner: " + (twilioSid?.substring(0, 12) || "none") + ")" };
       }
 
       // 3. Tell the AI to announce the transfer
-      //    FIX #9: Use role:"user" instead of "system" (OpenAI Realtime
-      //    only accepts "user" and "assistant" in conversation.item.create)
+      //    FIX #9: Use role:"user" (OpenAI Realtime only accepts "user"/"assistant")
       if (session.openaiWs?.readyState === WebSocket.OPEN) {
         session.openaiWs.send(JSON.stringify({
           type: "conversation.item.create",
           item: {
             type: "message",
-            role: "user",  // FIX #9: was "system" which is invalid for Realtime API
-            content: [{ type: "input_text", text: `[TRANSFER] Say exactly: "Transferring your call to ${target.name}, please hold." - Do NOT say anything else after this.` }]
+            role: "user",
+            content: [{ type: "input_text", text: `[TRANSFER] Say exactly: "Transferring your call to ${agentName}, please hold." - Do NOT say anything else after this.` }]
           }
         }));
         ResponseLockManager.sendResponseCreateSafe(
@@ -2058,16 +2126,14 @@ class ToolExecutor {
         );
       }
 
-      // FIX #1: Do NOT set callEnding here - it blocks _sendToolResult.
+      // FIX #1: Do NOT set callEnding here — it blocks _sendToolResult.
       // It will be set inside the setTimeout AFTER the tool result has been sent.
 
-      // 5. Execute Twilio redirect after delay for AI announcement
-      setTimeout(async () => {
+      // 4. Execute Twilio redirect after delay for AI announcement
+      session.transferTimeout = setTimeout(async () => {
         // FIX #3: Verify session is still valid before executing
         if (!session.callSid || session.sessionDestroyed) {
-          logger.warn("Session already destroyed before transfer redirect", {
-            callSid: session.callSid || "unknown"
-          });
+          logger.warn("Session already destroyed before transfer redirect", { callSid: session.callSid || "unknown" });
           return;
         }
 
@@ -2075,18 +2141,17 @@ class ToolExecutor {
         session.callEnding = true;
 
         try {
-          const twiml = `<Response><Say voice="Polly.Lupe-Neural" language="es-US">Transfiriendo su llamada a ${target.name}. Por favor espere.</Say><Dial timeout="30"><Number>${dialTarget}</Number></Dial><Say voice="Polly.Lupe-Neural" language="es-US">No pudimos completar la transferencia. Intente mas tarde.</Say><Hangup/></Response>`;
+          const twiml = `<Response><Say voice="Polly.Lupe-Neural" language="es-US">Transfiriendo su llamada a ${agentName}. Por favor espere.</Say><Dial timeout="30"><Number>${dialTarget}</Number></Dial><Say voice="Polly.Lupe-Neural" language="es-US">No pudimos completar la transferencia. Intente mas tarde.</Say><Hangup/></Response>`;
 
-          // CRITICAL: Use twilioSid (owner of the call), NOT env var
           const twilioUrl = `https://api.twilio.com/2010-04-01/Accounts/${twilioSid}/Calls/${session.callSid}.json`;
           const authHeader = "Basic " + Buffer.from(`${twilioSid}:${twilioToken}`).toString("base64");
 
           logger.info("Executing Twilio transfer redirect", {
             callSid: session.callSid,
             dialTarget,
-            agentName: target.name,
+            agentName,
             ownerSid: twilioSid.substring(0, 12) + "...",
-            ownerMatchesEnv: twilioSid === process.env.TWILIO_ACCOUNT_SID
+            lockId
           });
 
           const twilioRes = await fetch(twilioUrl, {
@@ -2106,47 +2171,33 @@ class ToolExecutor {
               error: errText,
               usedSid: twilioSid.substring(0, 12) + "..."
             });
+            // Release lock on failure so agent becomes available again
+            releaseAgentOnCallEnd(session).catch(() => {});
           } else {
-            logger.info("Twilio transfer redirect SUCCESS", {
-              callSid: session.callSid,
-              dialTarget,
-              agentName: target.name
-            });
+            logger.info("Twilio transfer redirect SUCCESS", { callSid: session.callSid, dialTarget, agentName });
           }
 
-          // 6. Update agent status to busy (non-critical)
-          try {
-            await SupabaseClient.request("agents_new?id=eq." + target.id, "PATCH", { availability: "busy" });
-          } catch (e) { /* non-critical */ }
-
-          // 7. Update call record (non-critical)
+          // 5. Update call record (non-critical)
           try {
             await SupabaseClient.request("calls?call_sid=eq." + session.callSid, "PATCH", {
-              transferred_to_agent_id: target.id,
+              transferred_to_agent_id: agentId,
               call_state: "transferred"
             });
           } catch (e) { /* non-critical */ }
 
-          // 8. Close OpenAI WebSocket after redirect takes effect
+          // 6. Close WebSockets after redirect takes effect
           setTimeout(() => {
-            if (session.openaiWs?.readyState === WebSocket.OPEN) {
-              session.openaiWs.close(1000, "transfer");
-            }
-            // FIX #6: Also close Twilio WebSocket to prevent leaks
-            if (session.twilioWs?.readyState === WebSocket.OPEN) {
-              session.twilioWs.close(1000, "transfer");
-            }
+            if (session.openaiWs?.readyState === WebSocket.OPEN) session.openaiWs.close(1000, "transfer");
+            if (session.twilioWs?.readyState === WebSocket.OPEN) session.twilioWs.close(1000, "transfer");
           }, 2000);
 
         } catch (transferErr) {
-          logger.error("Transfer execution error", {
-            callSid: session.callSid,
-            error: transferErr.message
-          });
+          logger.error("Transfer execution error", { callSid: session.callSid, error: transferErr.message });
+          releaseAgentOnCallEnd(session).catch(() => {});
         }
       }, 2500); // Wait 2.5s for AI announcement before Twilio redirect
 
-      return { success: true, transfer_to: dialTarget, agent_name: target.name, action: "transfer" };
+      return { success: true, transfer_to: dialTarget, agent_name: agentName, action: "transfer" };
 
     } catch (e) {
       session.transferInProgress = false;
@@ -2610,6 +2661,21 @@ class TwilioHandler {
 
     twilioWs.on("close", () => {
       logger.info("Twilio WebSocket closed", { sessionId, callSid: session.callSid });
+
+      // ✅ FAIL-SAFE: Release agent lock on WS close (covers all disconnect scenarios)
+      const _closeSid = session?.callSid || session?.twilioCallSid;
+      if (_closeSid && (session?.transferLockId || session?.transferAgentId)) {
+        logger.info("[AGENT-RELEASE] WS close fail-safe triggered", { callSid: _closeSid });
+        fetch(`${SUPABASE_URL}/functions/v1/agent-router`, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ action: "release", company_id: session.companyId, call_sid: _closeSid })
+        }).catch(err => logger.error("[AGENT-RELEASE] fail-safe error", { callSid: _closeSid, error: err.message }));
+      }
+
       SessionManager.deleteSession(sessionId);
     });
 
@@ -2892,6 +2958,13 @@ OUTPUT FORMAT:
 
     if (session.openaiWs?.readyState === WebSocket.OPEN) {
       session.openaiWs.close(1000, "stream_stopped");
+    }
+
+    // Release agent lock if a transfer was initiated (fire-and-forget)
+    if (session.transferLockId || session.transferAgentId) {
+      releaseAgentOnCallEnd(session).catch(e =>
+        logger.warn("[CLEANUP] releaseAgentOnCallEnd failed in _handleStop", { callSid: session.callSid, error: e.message })
+      );
     }
 
     // Send webhook if configured
