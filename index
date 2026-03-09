@@ -3233,6 +3233,8 @@ OUTPUT FORMAT:
           clearTimeout(session.voicemailSafetyTimer);
           session.voicemailSafetyTimer = null;
         }
+        // Trigger voicemail handling
+        session.voicemailDetected = true;
         setTimeout(() => {
           if (!session.voicemailHandled && !session.callEnding && !session.sessionDestroyed) {
             VoicemailDetector.handleDetection(session).catch(err =>
