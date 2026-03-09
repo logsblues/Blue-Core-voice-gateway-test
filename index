@@ -80,7 +80,7 @@ import http from "http";
 // SECTION 1: CONFIGURATION & CONSTANTS
 // ============================================================
 
-const VERSION = "7.2.5";
+const VERSION = "7.2.6";
 const PORT = process.env.PORT || 10000;
 
 // Environment variables (required)
@@ -2534,6 +2534,22 @@ class OpenAIHandler {
             if (!session.callEnding) {
               AutoHangupManager.checkForGoodbye(session, event.transcript);
             }
+
+            // ✅ v7.2.6 FIX: Monologue detection moved HERE (after each AI turn)
+            // so it fires even when userCount=0 (voicemail box produces no transcript).
+            // Previous location (inside user transcript handler) never fired when
+            // OpenAI Whisper produced 0 user transcripts from the voicemail audio.
+            if (!session.voicemailHandled && !session.callEnding &&
+                session.aiTurnCount >= 2 && (session.userTurnCount || 0) === 0) {
+              logger.warn("Monologue detection (AI-side): treating as voicemail", {
+                callSid: session.callSid,
+                aiTurns: session.aiTurnCount,
+                userTurns: session.userTurnCount || 0
+              });
+              VoicemailDetector.handleDetection(session).catch(err =>
+                logger.error("Voicemail handleDetection error", { callSid: session.callSid, error: err.message })
+              );
+            }
           }
           break;
 
@@ -2557,9 +2573,9 @@ class OpenAIHandler {
               await VoicemailDetector.handleDetection(session);
             }
 
-            // ✅ v6.3.0 POINT D: Monologue detection — if AI spoke 3+ turns and user said ≤1, treat as voicemail
+            // ✅ v6.3.0 POINT D: Monologue detection (user-side backup — primary is now in AI transcript handler)
             if (!session.voicemailHandled && session.aiTurnCount >= 3 && session.userTurnCount <= 1) {
-              logger.warn("Monologue detection: treating as voicemail", {
+              logger.warn("Monologue detection (user-side): treating as voicemail", {
                 callSid: session.callSid,
                 aiTurns: session.aiTurnCount,
                 userTurns: session.userTurnCount
