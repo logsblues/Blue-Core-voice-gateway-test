@@ -80,7 +80,7 @@ import http from "http";
 // SECTION 1: CONFIGURATION & CONSTANTS
 // ============================================================
 
-const VERSION = "7.2.7";
+const VERSION = "7.2.8";
 const PORT = process.env.PORT || 10000;
 
 // Environment variables (required)
@@ -1651,6 +1651,8 @@ class VoicemailDetector {
     }
 
     session.callEnding = true;
+    // ✅ CHANGE 5: Increase WS close delay 500ms → 3000ms to ensure all audio
+    // frames have been flushed to Twilio before closing the connection.
     setTimeout(() => {
       if (session.openaiWs?.readyState === WebSocket.OPEN) session.openaiWs.close(1000, "voicemail");
       setTimeout(() => {
@@ -1658,8 +1660,8 @@ class VoicemailDetector {
           logger.info("Closing Twilio WebSocket after voicemail", { callSid: session.callSid });
           session.twilioWs.close(1000, "voicemail");
         }
-      }, 500);
-    }, 500);
+      }, 3000); // ✅ CHANGE 5: 500ms → 3000ms
+    }, 3000); // ✅ CHANGE 5: 500ms → 3000ms
   }
 }
 
@@ -2038,9 +2040,22 @@ class ToolExecutor {
       if (toolName === "end_call") {
         // ✅ v6.3.0 POINT C: If AI calls end_call during voicemail mode, force hangup
         if (session.isVoicemailMode) {
-          logger.info("AI called end_call after voicemail script — executing hangup", { callSid: session.callSid });
-          VoicemailDetector.forceHangup(session);
-          result = { success: true, action: "voicemail_hangup" };
+          // ✅ CHANGE 4: Delay hangup to allow TTS audio playback to finish.
+          // The AI calls end_call as soon as it finishes generating text, but the
+          // audio (TTS) is still streaming to Twilio. Without this delay, the WS
+          // closes mid-playback and the caller hears a truncated voicemail message.
+          const scriptLen = session.voicemailConfig?.voicemail_script?.length || 0;
+          // Estimate playback time: ~12 chars/sec TTS + 3s buffer, minimum 15s
+          const estimatedPlaybackMs = Math.max(15000, Math.ceil(scriptLen / 12) * 1000 + 3000);
+          logger.info("[CHANGE 4] AI called end_call in voicemail mode — delaying hangup for audio playback", {
+            callSid: session.callSid,
+            scriptLen,
+            delayMs: estimatedPlaybackMs
+          });
+          setTimeout(() => {
+            if (!session.voicemailHungUp) VoicemailDetector.forceHangup(session);
+          }, estimatedPlaybackMs);
+          result = { success: true, action: "voicemail_hangup_delayed", delayMs: estimatedPlaybackMs };
         } else {
           result = await this._executeEndCall(session, args);
         }
