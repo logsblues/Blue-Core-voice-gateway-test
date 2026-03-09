@@ -80,7 +80,7 @@ import http from "http";
 // SECTION 1: CONFIGURATION & CONSTANTS
 // ============================================================
 
-const VERSION = "7.2.9";
+const VERSION = "7.2.10";
 const PORT = process.env.PORT || 10000;
 
 // Environment variables (required)
@@ -2577,7 +2577,10 @@ class OpenAIHandler {
             AutoHangupManager.cancelHangup(session);
 
             // ✅ v6.4.0: Cancel voicemail safety timer — real human answered
-            if (session.voicemailSafetyTimer) {
+            // ✅ FIX 3 v7.2.9: Don't cancel if AMD already confirmed machine
+            if (session.answeredBy && session.answeredBy.startsWith('machine')) {
+              logger.info("[v7.2.9] Ignoring speech detection — AMD confirmed machine", { callSid: session.callSid, answeredBy: session.answeredBy });
+            } else if (session.voicemailSafetyTimer) {
               clearTimeout(session.voicemailSafetyTimer);
               session.voicemailSafetyTimer = null;
               logger.info("[v6.4.0] Voicemail safety timer cancelled — human answered", { callSid: session.callSid });
@@ -2919,6 +2922,15 @@ class TwilioHandler {
     const interpreterLeg = params.interpreterLeg || params.interpreter_leg || null;
     if (interpreterLeg) session.interpreterLeg = interpreterLeg;
 
+    // ✅ FIX 1 v7.2.9: Read Twilio AMD result
+    session.answeredBy = params.answeredBy || params.answered_by || null;
+    if (session.answeredBy) {
+      logger.info("[v7.2.9] Twilio AMD result", {
+        callSid: session.callSid,
+        answeredBy: session.answeredBy,
+      });
+    }
+
     logger.info("TwiML params", { dynB64: !!dynB64, fmB64: !!fmB64, prepId, forceNew: forceNewSession, skipPrewarm });
 
     if (dynB64) {
@@ -3210,11 +3222,31 @@ OUTPUT FORMAT:
         }, "outbound_generic");
       }
 
+      // ✅ FIX 2 v7.2.9: If Twilio AMD already detected machine, trigger voicemail immediately
+      if (session.answeredBy && session.answeredBy.startsWith('machine')) {
+        logger.info("[v7.2.9] AMD detected machine \u2014 triggering voicemail protocol immediately", {
+          callSid: session.callSid,
+          answeredBy: session.answeredBy,
+          hasScript: !!session.voicemailConfig?.voicemailScript,
+        });
+        if (session.voicemailSafetyTimer) {
+          clearTimeout(session.voicemailSafetyTimer);
+          session.voicemailSafetyTimer = null;
+        }
+        setTimeout(() => {
+          if (!session.voicemailHandled && !session.callEnding && !session.sessionDestroyed) {
+            VoicemailDetector.handleDetection(session).catch(err =>
+              logger.error("[v7.2.9] AMD handleDetection error", { callSid: session.callSid, error: err.message })
+            );
+          }
+        }, 2000);
+      }
+
       // ✅ v6.4.0: Voicemail safety timer for outbound calls
       // OpenAI Whisper produces 0 transcripts from answering-machine audio,
       // so pattern detection and monologue detection never fire.
       // This timer triggers voicemail handling if no user transcript arrives in 15s.
-      if (!session.voicemailSafetyTimer) {
+      if (!session.voicemailSafetyTimer && !(session.answeredBy && session.answeredBy.startsWith('machine'))) {
         session.voicemailSafetyTimer = setTimeout(() => {
           session.voicemailSafetyTimer = null;
           if (!session.voicemailHandled && !session.callEnding &&
