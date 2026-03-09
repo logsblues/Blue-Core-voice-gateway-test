@@ -80,7 +80,7 @@ import http from "http";
 // SECTION 1: CONFIGURATION & CONSTANTS
 // ============================================================
 
-const VERSION = "7.2.4";
+const VERSION = "7.2.5";
 const PORT = process.env.PORT || 10000;
 
 // Environment variables (required)
@@ -210,6 +210,19 @@ const VOICEMAIL_PATTERNS = [
   /al\s+escuchar\s+el\s+tono/i, /buz[oÃƒÂ³]n\s+de\s+voz/i,
   /please\s+leave\s+your\s+message/i, /not\s+available.*leave.*message/i
 ];
+
+// ✅ v6.3.0: VAD configs for voicemail mode
+const VOICEMAIL_VAD_CONFIG = {
+  silence_duration_ms: 2000,   // Much longer silence tolerance
+  threshold: 0.9,              // Very high threshold - ignore most noise
+  prefix_padding_ms: 600,      // More padding
+};
+
+const NORMAL_VAD_CONFIG = {
+  silence_duration_ms: 900,
+  threshold: 0.65,
+  prefix_padding_ms: 400,
+};
 
 // Goodbye detection patterns
 const GOODBYE_PATTERNS = [
@@ -661,6 +674,11 @@ class SessionManager {
       greetingMessageSent: false,
       greetingTriggered: false,
       voicemailHandled: false,
+      isVoicemailMode: false,
+      voicemailHungUp: false,
+      voicemailTimeout: null,
+      aiTurnCount: 0,       // ✅ v6.3.0 POINT D: monologue detection
+      userTurnCount: 0,     // ✅ v6.3.0 POINT D: monologue detection
       firstAudioSent: false,
       skipGreeting: config.skipGreeting || false,
       isDemoCall: config.isDemoCall || false,
@@ -1075,7 +1093,13 @@ class SupabaseClient {
         if (prep.tts_voice_agent) session.ttsVoiceAgent = prep.tts_voice_agent;
         if (prep.tts_voice_customer) session.ttsVoiceCustomer = prep.tts_voice_customer;
         if (prep.glossary_json) session.glossaryJson = prep.glossary_json;
-        logger.info("Prep loaded from call_prep_sessions", { prepId, hasInstructions: !!session.dynamicInstructions, callMode: session.callMode || "ai_agent" });
+        // ✅ v6.3.0 POINT A: Load voicemail config from prep session
+        session.voicemailConfig = {
+          voicemailScript: prep.voicemail_script || null,
+          openingGreeting: prep.opening_greeting || null,
+          strictVoicemailMode: prep.strict_voicemail_mode || false,
+        };
+        logger.info("Prep loaded from call_prep_sessions", { prepId, hasInstructions: !!session.dynamicInstructions, callMode: session.callMode || "ai_agent", hasVoicemailScript: !!prep.voicemail_script });
         return;
       }
 
@@ -1095,7 +1119,13 @@ class SupabaseClient {
         if (bcPrep.tts_voice_agent) session.ttsVoiceAgent = bcPrep.tts_voice_agent;
         if (bcPrep.tts_voice_customer) session.ttsVoiceCustomer = bcPrep.tts_voice_customer;
         if (bcPrep.glossary_json) session.glossaryJson = bcPrep.glossary_json;
-        logger.info("Prep loaded from bc_call_prep_sessions", { prepId, callMode: session.callMode || "ai_agent" });
+        // ✅ v6.3.0 POINT A (bc fallback): Load voicemail config
+        session.voicemailConfig = {
+          voicemailScript: bcPrep.voicemail_script || null,
+          openingGreeting: bcPrep.opening_greeting || null,
+          strictVoicemailMode: bcPrep.strict_voicemail_mode || false,
+        };
+        logger.info("Prep loaded from bc_call_prep_sessions", { prepId, callMode: session.callMode || "ai_agent", hasVoicemailScript: !!bcPrep.voicemail_script });
       }
     } catch (e) {
       logger.error("Prep session load error", { prepId, error: e.message });
@@ -1526,29 +1556,106 @@ class VoicemailDetector {
   static async handleDetection(session) {
     if (session.voicemailHandled) return;
     session.voicemailHandled = true;
+    session.isVoicemailMode = true;
 
-    logger.warn("Voicemail detected", { callSid: session.callSid });
+    const voicemailScript = session.voicemailConfig?.voicemailScript;
+    const strictMode = session.voicemailConfig?.strictVoicemailMode;
 
-    try {
-      await CRMToolsClient.executeTool(
-        "end_call",
-        {
-          reason: "voicemail_detected", outcome: "voicemail",
-          phone: session.customerPhone || "",
-          contactName: session.preloadedContact?.name || "",
-          goodbye_message: ""
-        },
-        { companyId: session.companyId, agentId: session.agentId, callSid: session.callSid }
-      );
-    } catch (error) {
-      logger.error("Voicemail handler error", { callSid: session.callSid, error: error.message });
+    logger.warn("Voicemail detected (v6.3.0)", {
+      callSid: session.callSid,
+      hasScript: !!voicemailScript,
+      strict: strictMode
+    });
+
+    // ✅ v6.3.0 STEP 1: Suppress VAD to prevent background noise from interrupting message
+    if (session.openaiWs?.readyState === WebSocket.OPEN) {
+      try {
+        session.openaiWs.send(JSON.stringify({
+          type: "session.update",
+          session: {
+            turn_detection: {
+              type: "server_vad",
+              ...VOICEMAIL_VAD_CONFIG,
+            },
+            input_audio_transcription: null,
+          }
+        }));
+        logger.info("VAD suppressed for voicemail playback", { callSid: session.callSid });
+      } catch (err) {
+        logger.error("Failed to suppress VAD for voicemail", { callSid: session.callSid, error: err.message });
+      }
+    }
+
+    if (voicemailScript) {
+      // ✅ v6.3.0 STEP 2: Inject script and force AI to dictate it
+      try {
+        const instruction = strictMode
+          ? `[SISTEMA: BUZÓN DE VOZ DETECTADO] Dicta el siguiente mensaje EXACTAMENTE como está escrito, sin agregar ni cambiar nada. Después de terminar, espera 2 segundos y llama end_call con reason "voicemail_detected". Mensaje: "${voicemailScript}"`
+          : `[SISTEMA: BUZÓN DE VOZ DETECTADO] Deja el siguiente mensaje de voz de forma natural y profesional. Después de terminar, espera 2 segundos y llama end_call con reason "voicemail_detected". Mensaje: "${voicemailScript}"`;
+
+        if (session.openaiWs?.readyState === WebSocket.OPEN) {
+          session.openaiWs.send(JSON.stringify({
+            type: "conversation.item.create",
+            item: {
+              type: "message",
+              role: "user",
+              content: [{ type: "input_text", text: instruction }],
+            }
+          }));
+          session.openaiWs.send(JSON.stringify({ type: "response.create" }));
+        }
+
+        logger.info("Voicemail script injected", { callSid: session.callSid, scriptLength: voicemailScript.length });
+
+        // ✅ v6.3.0 STEP 3: Safety timeout — force hangup if AI doesn't call end_call in 30s
+        session.voicemailTimeout = setTimeout(() => {
+          logger.warn("Voicemail safety timeout — forcing hangup", { callSid: session.callSid });
+          VoicemailDetector.forceHangup(session);
+        }, 30000);
+
+      } catch (err) {
+        logger.error("Failed to inject voicemail script", { callSid: session.callSid, error: err.message });
+        VoicemailDetector.forceHangup(session);
+      }
+    } else {
+      // No script configured — use old behavior (immediate hangup + CRM SMS)
+      logger.info("No voicemail script configured — hanging up immediately", { callSid: session.callSid });
+      try {
+        await CRMToolsClient.executeTool(
+          "end_call",
+          {
+            reason: "voicemail_detected", outcome: "voicemail",
+            phone: session.customerPhone || "",
+            contactName: session.preloadedContact?.name || "",
+            goodbye_message: ""
+          },
+          { companyId: session.companyId, agentId: session.agentId, callSid: session.callSid }
+        );
+      } catch (error) {
+        logger.error("Voicemail CRM end_call error", { callSid: session.callSid, error: error.message });
+      }
+      VoicemailDetector.forceHangup(session);
+    }
+  }
+
+  static forceHangup(session) {
+    if (session.voicemailHungUp) return;
+    session.voicemailHungUp = true;
+
+    // Clear safety timeout if still active
+    if (session.voicemailTimeout) {
+      clearTimeout(session.voicemailTimeout);
+      session.voicemailTimeout = null;
     }
 
     session.callEnding = true;
     setTimeout(() => {
       if (session.openaiWs?.readyState === WebSocket.OPEN) session.openaiWs.close(1000, "voicemail");
       setTimeout(() => {
-        if (session.twilioWs?.readyState === WebSocket.OPEN) session.twilioWs.close(1000, "voicemail");
+        if (session.twilioWs?.readyState === WebSocket.OPEN) {
+          logger.info("Closing Twilio WebSocket after voicemail", { callSid: session.callSid });
+          session.twilioWs.close(1000, "voicemail");
+        }
       }, 500);
     }, 500);
   }
@@ -1927,7 +2034,14 @@ class ToolExecutor {
 
     try {
       if (toolName === "end_call") {
-        result = await this._executeEndCall(session, args);
+        // ✅ v6.3.0 POINT C: If AI calls end_call during voicemail mode, force hangup
+        if (session.isVoicemailMode) {
+          logger.info("AI called end_call after voicemail script — executing hangup", { callSid: session.callSid });
+          VoicemailDetector.forceHangup(session);
+          result = { success: true, action: "voicemail_hangup" };
+        } else {
+          result = await this._executeEndCall(session, args);
+        }
       } else if (toolName === "transfer_to_human") {
         result = await this._executeTransfer(session, args);
       } else if (toolName === "lookup_contact") {
@@ -2415,6 +2529,7 @@ class OpenAIHandler {
         case "response.audio_transcript.done":
           if (event.transcript) {
             session.transcripts.assistant.push(event.transcript);
+            session.aiTurnCount = (session.aiTurnCount || 0) + 1; // ✅ v6.3.0 POINT D
             logger.debug("Assistant transcript", { callSid: session.callSid, transcript: event.transcript.substring(0, 100) });
             if (!session.callEnding) {
               AutoHangupManager.checkForGoodbye(session, event.transcript);
@@ -2434,8 +2549,21 @@ class OpenAIHandler {
               await LanguageDetector.updateSessionLanguage(session, detectedLang);
             }
 
+            // ✅ v6.3.0 POINT D: Track user turn count
+            session.userTurnCount = (session.userTurnCount || 0) + 1;
+
             // Voicemail detection
             if (!session.voicemailHandled && VoicemailDetector.detect(event.transcript)) {
+              await VoicemailDetector.handleDetection(session);
+            }
+
+            // ✅ v6.3.0 POINT D: Monologue detection — if AI spoke 3+ turns and user said ≤1, treat as voicemail
+            if (!session.voicemailHandled && session.aiTurnCount >= 3 && session.userTurnCount <= 1) {
+              logger.warn("Monologue detection: treating as voicemail", {
+                callSid: session.callSid,
+                aiTurns: session.aiTurnCount,
+                userTurns: session.userTurnCount
+              });
               await VoicemailDetector.handleDetection(session);
             }
           }
@@ -3466,6 +3594,11 @@ const server = http.createServer(async (req, res) => {
             greetingTriggered: false,
             callEnding: false,
             voicemailHandled: false,
+      isVoicemailMode: false,
+      voicemailHungUp: false,
+      voicemailTimeout: null,
+      aiTurnCount: 0,       // ✅ v6.3.0 POINT D: monologue detection
+      userTurnCount: 0,     // ✅ v6.3.0 POINT D: monologue detection
             firstAudioSent: false,
             pendingSessionUpdate: false,
             responseLock: { isLocked: false, lockedBy: null, lockedAt: null },
