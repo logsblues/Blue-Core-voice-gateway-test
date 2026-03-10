@@ -80,7 +80,7 @@ import http from "http";
 // SECTION 1: CONFIGURATION & CONSTANTS
 // ============================================================
 
-const VERSION = "7.2.10";
+const VERSION = "7.3.0";
 const PORT = process.env.PORT || 10000;
 
 // Environment variables (required)
@@ -105,8 +105,8 @@ const UPSERT_CALL_RECORD_URL = SUPABASE_URL + "/functions/v1/upsert-call-record"
 const SYNC_TRANSCRIPT_URL = SUPABASE_URL + "/functions/v1/sync-transcript";
 
 // Timing constants
-const PREWARM_SESSION_TTL_MS = 90000;
-const PREWARM_CLEANUP_INTERVAL_MS = 15000;
+const PREWARM_SESSION_TTL_MS = 3 * 60 * 1000; // ✅ v7.3.0: 3 minutes (was 90s)
+const PREWARM_CLEANUP_INTERVAL_MS = 30 * 1000;  // ✅ v7.3.0: check every 30s (was 15s)
 const SESSION_UPDATE_TIMEOUT_MS = 3000;
 const AUTO_HANGUP_TIMEOUT_MS = 5000;
 const RINGBACK_INTERVAL_MS = 100;
@@ -337,6 +337,7 @@ class Parser {
     return String(phone).replace(/[^\d+]/g, "");
   }
 
+  // ✅ v7.3.0: UTF-8 safe base64 decoding (fixes Ã‚Â¡Hola! corruption)
   static decodeBase64Utf8(b64) {
     if (!b64 || typeof b64 !== "string") return null;
     try {
@@ -691,6 +692,8 @@ class SessionManager {
       // Timers
       autoHangupTimer: null,
       voicemailSafetyTimer: null,  // ✅ v6.4.0
+      sessionUpdated: false,        // ✅ v7.3.0: prevent duplicate session.update
+      toolLogsPersisted: false,      // ✅ v7.3.0: prevent duplicate tool log persist
       greetingTimer: null,
       ringbackInterval: null,
       ringbackFrames: 0,
@@ -1313,6 +1316,8 @@ class DynamicToolLoader {
 
       if (!res.ok || !res.data?.length) {
         logger.info("[DynamicToolLoader] No dynamic tools found, using defaults", { agentId });
+        // ✅ v7.3.0: Cache negative result to avoid repeated DB queries
+        this.cache.set(agentId, { tools: null, loadedAt: Date.now() });
         return null; // null = use hardcoded defaults
       }
 
@@ -1374,6 +1379,8 @@ class PlaybookLoader {
 
       if (!playbookRow) {
         logger.info("[PlaybookLoader] No active playbook found", { agentId });
+        // ✅ v7.3.0: Cache negative result to avoid repeated DB queries
+        this.cache.set(cacheKey, { playbook: null, loadedAt: Date.now() });
         return null;
       }
 
@@ -1426,6 +1433,12 @@ class ToolCallLogger {
 
   static async persist(session) {
     if (!session.prepId || !session.toolCallLog?.length) return;
+    // ✅ v7.3.0: Idempotent — only persist once per session
+    if (session.toolLogsPersisted) {
+      logger.info("[ToolCallLogger] Already persisted, skipping", { prepId: session.prepId });
+      return;
+    }
+    session.toolLogsPersisted = true;
 
     try {
       // Try bc_call_prep_sessions first
@@ -2676,6 +2689,12 @@ class OpenAIHandler {
   static sendSessionUpdate(session) {
     if (!session.openaiWs || session.openaiWs.readyState !== WebSocket.OPEN) return;
 
+    // ✅ v7.3.0: Prevent duplicate session.update for same call
+    if (session.callSid && session.sessionUpdated) {
+      logger.info("[v7.3.0] session.update already sent, skipping duplicate", { callSid: session.callSid });
+      return;
+    }
+
     const config = session.config;
     const prompt = PromptBuilder.build(session, config);
     const voice = VoiceMapper.mapToOpenAI(config.voice);
@@ -2722,6 +2741,7 @@ class OpenAIHandler {
       type: "session.update",
       session: sessionConfig
     }));
+    if (session.callSid) session.sessionUpdated = true; // ✅ v7.3.0
   }
 
   static async syncTranscripts(session) {
@@ -2954,11 +2974,15 @@ class TwilioHandler {
     // ==================== PREWARM REUSE ====================
     let prewarmSession = prepId ? prewarmSessions.get(prepId) : null;
 
-    if (prewarmSession && (forceNewSession || skipPrewarm)) {
-      logger.info("Force destroy prewarm", { forceNew: forceNewSession, skipPrewarm });
-      if (prewarmSession.openaiWs?.readyState === WebSocket.OPEN) prewarmSession.openaiWs.close(1000, "force_new_session");
+    // ✅ v7.3.0: Only destroy prewarm if EXPLICITLY forced — skipPrewarm just skips reuse, doesn't destroy
+    if (prewarmSession && forceNewSession) {
+      logger.info("[v7.3.0] Force new session — destroying prewarm", { callSid: session.callSid });
+      if (prewarmSession.openaiWs?.readyState === WebSocket.OPEN) prewarmSession.openaiWs.close(1000, "force_new_requested");
       prewarmSessions.delete(prepId);
       prewarmSession = null;
+    } else if (prewarmSession && skipPrewarm) {
+      logger.info("[v7.3.0] skipPrewarm=true — skipping reuse but keeping prewarm alive", { callSid: session.callSid });
+      prewarmSession = null; // don't use it, but don't destroy it
     }
 
     if (prewarmSession && prewarmSession.sessionReady) {
@@ -2990,6 +3014,7 @@ class TwilioHandler {
       session.voicemailConfig = session.voicemailConfig || prewarmSession.voicemailConfig || null;
       session.language = session.language || prewarmSession.language;
       session.greetingMessageSent = false;
+      session.sessionUpdated = false; // ✅ v7.3.0: reset for new session.update on prewarm reuse
 
       prewarmSessions.delete(prepId);
 
