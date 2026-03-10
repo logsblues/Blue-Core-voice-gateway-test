@@ -80,7 +80,7 @@ import http from "http";
 // SECTION 1: CONFIGURATION & CONSTANTS
 // ============================================================
 
-const VERSION = "7.3.3";
+const VERSION = "7.3.4";
 const PORT = process.env.PORT || 10000;
 
 // Environment variables (required)
@@ -696,6 +696,10 @@ class SessionManager {
       toolLogsPersisted: false,      // ✅ v7.3.0: prevent duplicate tool log persist
       voicemailScriptInjected: false, // ✅ v7.3.3: prevent double voicemail injection
       _voicemailForceInjected: false, // ✅ v7.3.3: safety fallback flag
+      _hasActiveResponse: false,      // ✅ v7.3.4: track OpenAI response state
+      _pendingVoicemailInject: false, // ✅ v7.3.4: deferred voicemail injection
+      _voicemailScriptDelivered: false, // ✅ v7.3.4: idempotent voicemail delivery
+      _sessionUpdateSent: false,      // ✅ v7.3.4: prevent duplicate session.update
       greetingTimer: null,
       ringbackInterval: null,
       ringbackFrames: 0,
@@ -1563,79 +1567,70 @@ class LanguageDetector {
 
 
 // ============================================================
-// VOICEMAIL INJECTION HELPER — v7.3.3
-// Cancels active response before injecting script to avoid
-// "conversation_already_has_active_response" errors
+// VOICEMAIL INJECTION HELPER — v7.3.4
+// Wait-for-idle approach: defers injection until OpenAI response is done
+// Eliminates "conversation_already_has_active_response" errors
 // ============================================================
-function injectVoicemailScript(session, openaiWs, voicemailScript, callSid) {
-  // Guard: prevent double injection
-  if (session.voicemailScriptInjected) {
-    logger.warn("[v7.3.3] Voicemail injection skipped — already injected", { callSid });
-    return;
-  }
-  session.voicemailScriptInjected = true;
+function injectVoicemailScript(session) {
+  if (session._voicemailScriptDelivered) return;
 
-  logger.info("[v7.3.3] Cancelling active response before voicemail injection", { callSid });
+  const script = session.voicemailConfig?.voicemailScript;
+  if (!script) return;
 
-  // Step 1: Cancel any active response
-  if (openaiWs?.readyState === WebSocket.OPEN) {
-    openaiWs.send(JSON.stringify({ type: "response.cancel" }));
-  }
+  logger.info("[v7.3.4] Voicemail injection requested", {
+    callSid: session.callSid,
+    hasActiveResponse: !!session._hasActiveResponse,
+    scriptLength: script.length
+  });
 
-  // Step 2: Queue injection after cancel completes
-  const onResponseDone = (rawMsg) => {
-    try {
-      const msg = JSON.parse(rawMsg.toString());
-      if (msg.type === "response.done" || msg.type === "response.cancelled") {
-        openaiWs.removeListener("message", onResponseDone);
+  if (session._hasActiveResponse) {
+    // Defer — will execute when response.done fires (handled in setupMessageHandler)
+    session._pendingVoicemailInject = true;
+    logger.info("[v7.3.4] Response active — deferring injection", { callSid: session.callSid });
 
-        logger.info("[v7.3.3] Active response cleared — injecting voicemail script now", {
-          callSid,
-          scriptLength: voicemailScript.length
-        });
-
-        if (openaiWs?.readyState === WebSocket.OPEN) {
-          // Step 3: Inject the voicemail script
-          openaiWs.send(JSON.stringify({
-            type: "conversation.item.create",
-            item: {
-              type: "message",
-              role: "user",
-              content: [{ type: "input_text", text: voicemailScript }]
+    // Safety fallback: 10s max wait
+    setTimeout(() => {
+      if (session._pendingVoicemailInject && !session._voicemailScriptDelivered) {
+        session._pendingVoicemailInject = false;
+        session._voicemailScriptDelivered = true;
+        logger.warn("[v7.3.4] 10s fallback — forcing voicemail injection", { callSid: session.callSid });
+        if (session.openaiWs?.readyState === WebSocket.OPEN) {
+          session.openaiWs.send(JSON.stringify({ type: "response.cancel" }));
+          setTimeout(() => {
+            if (session.openaiWs?.readyState === WebSocket.OPEN) {
+              session.openaiWs.send(JSON.stringify({
+                type: "conversation.item.create",
+                item: {
+                  type: "message", role: "user",
+                  content: [{ type: "input_text",
+                    text: `[SISTEMA - BUZÓN DE VOZ DETECTADO] Dicta este mensaje EXACTO: "${script}"`
+                  }]
+                }
+              }));
+              session.openaiWs.send(JSON.stringify({ type: "response.create" }));
             }
-          }));
-          // Step 4: Trigger response
-          openaiWs.send(JSON.stringify({ type: "response.create" }));
+          }, 500);
         }
       }
-    } catch (e) {
-      // ignore parse errors from non-JSON messages
-    }
-  };
-
-  if (openaiWs?.readyState === WebSocket.OPEN) {
-    openaiWs.on("message", onResponseDone);
+    }, 10000);
+    return;
   }
 
-  // Safety fallback: if no response.done arrives in 3s, inject anyway
-  setTimeout(() => {
-    openaiWs.removeListener("message", onResponseDone);
-    if (!session._voicemailForceInjected) {
-      session._voicemailForceInjected = true;
-      logger.warn("[v7.3.3] Voicemail injection safety fallback — no response.done received", { callSid });
-      if (openaiWs?.readyState === WebSocket.OPEN) {
-        openaiWs.send(JSON.stringify({
-          type: "conversation.item.create",
-          item: {
-            type: "message",
-            role: "user",
-            content: [{ type: "input_text", text: voicemailScript }]
-          }
-        }));
-        openaiWs.send(JSON.stringify({ type: "response.create" }));
+  // Idle — inject immediately
+  session._voicemailScriptDelivered = true;
+  if (session.openaiWs?.readyState === WebSocket.OPEN) {
+    session.openaiWs.send(JSON.stringify({
+      type: "conversation.item.create",
+      item: {
+        type: "message", role: "user",
+        content: [{ type: "input_text",
+          text: `[SISTEMA - BUZÓN DE VOZ DETECTADO] Dicta este mensaje EXACTO al buzón: "${script}"`
+        }]
       }
-    }
-  }, 3000);
+    }));
+    session.openaiWs.send(JSON.stringify({ type: "response.create" }));
+  }
+  logger.info("[v7.3.4] Voicemail script injected (idle)", { callSid: session.callSid });
 }
 
 /**
@@ -1687,11 +1682,11 @@ class VoicemailDetector {
           ? `[SISTEMA: BUZÓN DE VOZ DETECTADO] Dicta el siguiente mensaje EXACTAMENTE como está escrito, sin agregar ni cambiar nada. Después de terminar, espera 2 segundos y llama end_call con reason "voicemail_detected". Mensaje: "${voicemailScript}"`
           : `[SISTEMA: BUZÓN DE VOZ DETECTADO] Deja el siguiente mensaje de voz de forma natural y profesional. Después de terminar, espera 2 segundos y llama end_call con reason "voicemail_detected". Mensaje: "${voicemailScript}"`;
 
-        // ✅ v7.3.3: Use injectVoicemailScript to cancel active response first,
-        // preventing "conversation_already_has_active_response" errors
-        injectVoicemailScript(session, session.openaiWs, instruction, session.callSid);
+        // ✅ v7.3.4: Use injectVoicemailScript with wait-for-idle approach
+        // Defers injection until OpenAI response is done — no more "conversation_already_has_active_response"
+        injectVoicemailScript(session);
 
-        logger.info("Voicemail script queued for injection (v7.3.3)", { callSid: session.callSid, scriptLength: voicemailScript.length });
+        logger.info("Voicemail script queued for injection (v7.3.4)", { callSid: session.callSid, scriptLength: voicemailScript.length });
 
         // ✅ v6.3.0 STEP 3: Safety timeout — force hangup if AI doesn't call end_call in 30s
         session.voicemailTimeout = setTimeout(() => {
@@ -2696,8 +2691,42 @@ class OpenAIHandler {
           }
           break;
 
+        case "response.created":
+          session._hasActiveResponse = true; // ✅ v7.3.4: track active response
+          break;
+
         case "response.done":
           ResponseLockManager.unlock(session, "response.done");
+          session._hasActiveResponse = false; // ✅ v7.3.4: response is now idle
+
+          // ✅ v7.3.4: Execute deferred voicemail injection if pending
+          if (session._pendingVoicemailInject) {
+            session._pendingVoicemailInject = false;
+            logger.info("[v7.3.4] Response idle — executing deferred voicemail injection", {
+              callSid: session.callSid
+            });
+            const vmScript = session.voicemailConfig?.voicemailScript;
+            if (vmScript && !session._voicemailScriptDelivered) {
+              session._voicemailScriptDelivered = true;
+              if (session.openaiWs?.readyState === WebSocket.OPEN) {
+                session.openaiWs.send(JSON.stringify({
+                  type: "conversation.item.create",
+                  item: {
+                    type: "message", role: "user",
+                    content: [{ type: "input_text",
+                      text: `[SISTEMA - BUZÓN DE VOZ DETECTADO] Dicta este mensaje EXACTO al buzón: "${vmScript}"`
+                    }]
+                  }
+                }));
+                session.openaiWs.send(JSON.stringify({ type: "response.create" }));
+                logger.info("[v7.3.4] Deferred voicemail script injected", { callSid: session.callSid });
+              }
+            }
+          }
+          break;
+
+        case "response.cancelled":
+          session._hasActiveResponse = false; // ✅ v7.3.4: cancelled also clears active state
           break;
 
         case "response.function_call_arguments.done":
@@ -3086,8 +3115,17 @@ class TwilioHandler {
       session.language = session.language || prewarmSession.language;
       session.greetingMessageSent = false;
       session.sessionUpdated = false; // ✅ v7.3.0: reset for new session.update on prewarm reuse
+      session._sessionUpdateSent = false; // ✅ v7.3.4: allow override session.update on reuse
 
       prewarmSessions.delete(prepId);
+
+      // ✅ v7.3.4: CRITICAL — Remove ALL old prewarm listeners before re-binding
+      if (session.openaiWs) {
+        session.openaiWs.removeAllListeners('message');
+        session.openaiWs.removeAllListeners('error');
+        session.openaiWs.removeAllListeners('close');
+        logger.info("[v7.3.4] Cleared old prewarm listeners", { callSid: session.callSid });
+      }
 
       // Re-bind OpenAI handler to this session
       OpenAIHandler.setupMessageHandler(session);
