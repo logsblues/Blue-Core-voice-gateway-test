@@ -80,7 +80,7 @@ import http from "http";
 // SECTION 1: CONFIGURATION & CONSTANTS
 // ============================================================
 
-const VERSION = "7.3.4";
+const VERSION = "7.3.5";
 const PORT = process.env.PORT || 10000;
 
 // Environment variables (required)
@@ -107,6 +107,7 @@ const SYNC_TRANSCRIPT_URL = SUPABASE_URL + "/functions/v1/sync-transcript";
 // Timing constants
 const PREWARM_SESSION_TTL_MS = 3 * 60 * 1000; // ✅ v7.3.0: 3 minutes (was 90s)
 const PREWARM_CLEANUP_INTERVAL_MS = 30 * 1000;  // ✅ v7.3.0: check every 30s (was 15s)
+const PREWARM_SESSION_MAX_AGE_MS = 55 * 60 * 1000; // ✅ v7.3.5: 55 min hard cap (before OpenAI 60min WS limit)
 const SESSION_UPDATE_TIMEOUT_MS = 3000;
 const AUTO_HANGUP_TIMEOUT_MS = 5000;
 const RINGBACK_INTERVAL_MS = 100;
@@ -835,6 +836,8 @@ function createPrewarmSession(agentId, companyId, config) {
     sessionCreated: false,
     sessionReady: false,
     createdAt: Date.now(),
+    _createdAt: Date.now(),          // ✅ v7.3.5: for max lifetime tracking
+    _maxLifetimeMs: PREWARM_SESSION_MAX_AGE_MS, // ✅ v7.3.5: 55 min hard cap
     expiresAt: Date.now() + PREWARM_SESSION_TTL_MS
   };
   prewarmSessions.set(prepId, prewarmData);
@@ -860,7 +863,31 @@ function getPrewarmSession(agentId, companyId) {
 function cleanupExpiredPrewarmSessions() {
   const now = Date.now();
   let cleaned = 0;
+  let recycled = 0;
   for (const [prepId, prewarm] of prewarmSessions.entries()) {
+    const age = now - (prewarm._createdAt || prewarm.createdAt || 0);
+    const maxAge = prewarm._maxLifetimeMs || PREWARM_SESSION_MAX_AGE_MS;
+
+    // ✅ v7.3.5: Hard cap — recycle sessions approaching OpenAI 60min WS limit
+    if (age >= maxAge) {
+      logger.info("[PREWARM] Recycling expired session (max lifetime)", {
+        prepId,
+        agentId: prewarm.agentId,
+        ageMin: Math.round(age / 60000)
+      });
+      try { if (prewarm.openaiWs) prewarm.openaiWs.close(1000, "prewarm_max_lifetime"); } catch (e) {}
+      prewarmSessions.delete(prepId);
+      recycled++;
+      // Recreate replacement session if agentId/companyId/config available
+      if (prewarm.agentId && prewarm.companyId && prewarm.config) {
+        try { createPrewarmSession(prewarm.agentId, prewarm.companyId, prewarm.config); } catch (e) {
+          logger.warn("[PREWARM] Failed to recreate session after recycle", { prepId, err: String(e) });
+        }
+      }
+      continue;
+    }
+
+    // Standard TTL expiry
     if (prewarm.expiresAt <= now) {
       if (prewarm.openaiWs) {
         prewarm.openaiWs.close(1000, "prewarm_expired");
@@ -869,12 +896,11 @@ function cleanupExpiredPrewarmSessions() {
       cleaned++;
     }
   }
-  if (cleaned > 0) {
-    logger.info("Prewarm sessions cleaned", { count: cleaned });
-  }
+  if (cleaned > 0) logger.info("Prewarm sessions cleaned", { count: cleaned });
+  if (recycled > 0) logger.info("Prewarm sessions recycled (max lifetime)", { count: recycled });
 }
 
-setInterval(cleanupExpiredPrewarmSessions, PREWARM_CLEANUP_INTERVAL_MS);
+setInterval(cleanupExpiredPrewarmSessions, 60_000); // ✅ v7.3.5: check every 60s for max lifetime
 
 // ============================================================
 // SECTION 5: EXTERNAL SERVICES
