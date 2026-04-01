@@ -1932,6 +1932,8 @@ class CallScreeningEngine {
     }
   }
 }
+
+class ToolCallLogger {
   static record(session, toolName, args, result, durationMs) {
     if (!session.toolCallLog) session.toolCallLog = [];
     session.toolCallLog.push({
