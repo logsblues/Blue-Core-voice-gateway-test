@@ -1732,14 +1732,34 @@ class CallScreeningEngine {
         const timeoutData = await timeoutRes.json();
         logger.info("[SCREENING] Timeout result", { callSid: session.callSid, data: timeoutData });
 
-        // If PSTN was triggered, extend polling
-        if (timeoutData.pstn_triggered) {
-          logger.info("[SCREENING] PSTN fallback triggered, extending poll", { callSid: session.callSid });
-          // Continue polling — will resolve when PSTN picks up or times out
-        } else {
-          // No PSTN — go to AI resume
-          await this._resolveWithAiResume(session);
+        // ── v7.3.6 FIX: Do NOT resume AI if PSTN is now ringing the agent ──
+        if (timeoutData.action === "pstn_fallback" || timeoutData.pstn_triggered) {
+          logger.info("[SCREENING] PSTN ringing agent, keeping AI silent", {
+            callSid: session.callSid,
+            agentPhone: timeoutData.agent_phone,
+            pstnSid: timeoutData.pstn_call_sid,
+          });
+
+          // Set a secondary 25s timeout for PSTN (20s ring + 5s buffer)
+          // If agent doesn't answer PSTN either, THEN resume AI
+          setTimeout(async () => {
+            if (session.screeningResolved || session.callEnding || session.sessionDestroyed) return;
+
+            logger.info("[SCREENING] PSTN timeout — agent didn't answer, resuming AI", {
+              callSid: session.callSid,
+            });
+            session.screeningActive = false;
+            session.screeningResolved = true;
+            session.suppressModelAudio = false;
+            await this._resolveWithAiResume(session);
+          }, 25000);
+
+          return; // CRITICAL: do not fall through to AI resume
         }
+        // ── end fix ──
+
+        // No PSTN — go to AI resume immediately
+        await this._resolveWithAiResume(session);
       } catch (e) {
         logger.error("[SCREENING] Timeout handler error", { callSid: session.callSid, error: e.message });
         await this._resolveWithAiResume(session);
