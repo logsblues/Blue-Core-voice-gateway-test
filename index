@@ -782,6 +782,10 @@ class SessionManager {
       if (session.screeningPollTimer) clearInterval(session.screeningPollTimer);
       if (session.screeningTimeoutTimer) clearTimeout(session.screeningTimeoutTimer);
       session.sessionDestroyed = true;
+      // ── v7.3.6 FIX: reset screening flags ──
+      session.suppressModelAudio = false;
+      session.screeningActive = false;
+      // ── end fix ──
       // v7.1.0: Clean up interpreter partner references
       if (session.interpreterPartner) {
         session.interpreterPartner.interpreterPartner = null;
@@ -1862,6 +1866,11 @@ class CallScreeningEngine {
       "screening_ai_resume"
     );
 
+    // ── v7.3.6 FIX: re-enable audio before resume ──
+    session.suppressModelAudio = false;
+    session.screeningActive = false;
+    // ── end fix ──
+
     logger.info("[SCREENING] AI resume injected", {
       callSid: session.callSid,
       action: resume.action,
@@ -2682,11 +2691,19 @@ class ToolExecutor {
 
       // Only request a response if NOT ending the call
       if (!session.callEnding) {
-        ResponseLockManager.sendResponseCreateSafe(
-          session,
-          { type: "response.create", response: { modalities: ["text", "audio"] } },
-          "tool_result_" + toolName
-        );
+        // ── v7.3.6 FIX: skip AI response if screening is active ──
+        if (session.screeningActive && toolName === "transfer_to_human") {
+          logger.info("[TOOL_RESULT] Skipping response.create — screening active", {
+            callSid: session.callSid
+          });
+        } else {
+          ResponseLockManager.sendResponseCreateSafe(
+            session,
+            { type: "response.create", response: { modalities: ["text", "audio"] } },
+            "tool_result_" + toolName
+          );
+        }
+        // ── end fix ──
       }
     }
   }
@@ -2794,6 +2811,15 @@ class ToolExecutor {
       return { success: false, error: "Transfer already in progress" };
     }
     session.transferInProgress = true;
+
+    // ── v7.3.6 FIX: suppress AI audio IMMEDIATELY before screening ──
+    session.suppressModelAudio = true;
+    session.screeningActive = true;
+    try {
+      session.openaiWs?.send(JSON.stringify({ type: "response.cancel" }));
+      logger.info("[TRANSFER] Cancelled active AI response before screening", { callSid: session.callSid });
+    } catch (_) {}
+    // ── end fix ──
 
     try {
       // ==================== NEW: Use Call Screening Engine ====================
@@ -3125,6 +3151,11 @@ class OpenAIHandler {
           break;
 
         case "response.audio.delta":
+          // ── v7.3.6 FIX: drop audio while screening ──
+          if (session.suppressModelAudio) {
+            break;
+          }
+          // ── end fix ──
           // v7.1.0: Interpreter cross-routing
           // In interpreter mode, send translated audio to the PARTNER's stream
           let targetWs = session.twilioWs;
