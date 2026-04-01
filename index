@@ -666,7 +666,8 @@ class SessionManager {
       streamSid: null,
 
       // Call Screening state
-      screeningActive: false,
+      screeningActive: false,       // ── v7.3.6: initialized false, set by initiateScreening() internally ──
+      suppressModelAudio: false,    // ── v7.3.6: suppress OpenAI audio during screening ──
       screeningCallId: null,        // voicecore_calls.id
       screeningVoicecoreId: null,   // human-readable ID (VC-XXXX)
       screeningStrategy: null,      // 'standard' | 'parallel' | 'bypass' | 'ai_only'
@@ -1489,13 +1490,15 @@ class CallScreeningEngine {
    * Entry point: called when the AI detects "user wants to speak to agent"
    * via the transfer_to_human tool OR a screening_call tool.
    */
-  static async initiateScreening(session, args) {
+   static async initiateScreening(session, args) {
+    // Check FIRST — guard against double-entry
     if (session.screeningActive || session.screeningResolved) {
       logger.warn("[SCREENING] Already active or resolved", { callSid: session.callSid });
       return { success: false, error: "Screening already in progress" };
     }
-
+    // THEN set the flag (after the guard, not before)
     session.screeningActive = true;
+    session.screeningResolved = false;
     const customerPhone = session.customerPhone || session.fromNumber || "";
     const customerName = args?.customer_name || args?.customerName || session.preloadedContact?.safeName || "";
     const customerCompany = args?.customer_company || args?.customerCompany || "";
@@ -2814,7 +2817,7 @@ class ToolExecutor {
 
     // ── v7.3.6 FIX: suppress AI audio IMMEDIATELY before screening ──
     session.suppressModelAudio = true;
-    session.screeningActive = true;
+    // DO NOT set screeningActive here — initiateScreening() sets it internally after its own guard check
     try {
       session.openaiWs?.send(JSON.stringify({ type: "response.cancel" }));
       logger.info("[TRANSFER] Cancelled active AI response before screening", { callSid: session.callSid });
