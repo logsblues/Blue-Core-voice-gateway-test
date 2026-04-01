@@ -1479,6 +1479,9 @@ class PlaybookLoader {
  * ToolCallLogger - Persist tool call logs to bc_call_prep_sessions (NEW v7)
  */
 class ToolCallLogger {
+  // ... (todo el contenido existente de ToolCallLogger)
+}
+
 // ============================================================
 // CALL SCREENING ENGINE — Orchestrator-driven call routing
 // ============================================================
