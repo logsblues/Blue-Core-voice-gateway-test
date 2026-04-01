@@ -137,6 +137,19 @@ const DEFAULT_TIMEZONE = "America/New_York";
 const DEFAULT_LANGUAGE = "es";
 const DEFAULT_VOICE = "alloy";
 
+// ============================================================
+// CALL SCREENING CONSTANTS
+// ============================================================
+const SCREENING_ORCHESTRATOR_URL = SUPABASE_URL + "/functions/v1/call-screening-orchestrator";
+const SCREENING_RESPOND_URL = SUPABASE_URL + "/functions/v1/call-screening-respond";
+const SCREENING_HANGUP_URL = SUPABASE_URL + "/functions/v1/call-screening-hangup";
+const SCREENING_AI_RESUME_URL = SUPABASE_URL + "/functions/v1/call-screening-ai-resume";
+const SCREENING_TIMEOUT_URL = SUPABASE_URL + "/functions/v1/call-screening-timeout";
+const SCREENING_BRIDGE_URL = SUPABASE_URL + "/functions/v1/call-screening-bridge";
+
+const HOLD_MESSAGE_INTERVAL_MS = 5000; // 5 seconds between hold messages
+const SCREENING_POLL_INTERVAL_MS = 2000; // Poll DB for agent response
+
 // Session pools
 const sessions = new Map();
 const prewarmSessions = new Map();
@@ -652,6 +665,18 @@ class SessionManager {
       openaiWs: null,
       streamSid: null,
 
+      // Call Screening state
+      screeningActive: false,
+      screeningCallId: null,        // voicecore_calls.id
+      screeningVoicecoreId: null,   // human-readable ID (VC-XXXX)
+      screeningStrategy: null,      // 'standard' | 'parallel' | 'bypass' | 'ai_only'
+      screeningHoldMessages: [],
+      screeningHoldIndex: 0,
+      screeningHoldTimer: null,
+      screeningPollTimer: null,
+      screeningTimeoutTimer: null,
+      screeningResolved: false,     // Prevents double resolution
+
       // Conversational state
       transcripts: { user: [], assistant: [] },
       toolCalls: [],
@@ -753,6 +778,9 @@ class SessionManager {
       if (session.greetingTimer) clearTimeout(session.greetingTimer);
       if (session.ringbackInterval) clearInterval(session.ringbackInterval);
       if (session.voicemailSafetyTimer) clearTimeout(session.voicemailSafetyTimer); // ✅ v6.4.0
+      if (session.screeningHoldTimer) clearInterval(session.screeningHoldTimer);
+      if (session.screeningPollTimer) clearInterval(session.screeningPollTimer);
+      if (session.screeningTimeoutTimer) clearTimeout(session.screeningTimeoutTimer);
       session.sessionDestroyed = true;
       // v7.1.0: Clean up interpreter partner references
       if (session.interpreterPartner) {
@@ -1451,6 +1479,456 @@ class PlaybookLoader {
  * ToolCallLogger - Persist tool call logs to bc_call_prep_sessions (NEW v7)
  */
 class ToolCallLogger {
+// ============================================================
+// CALL SCREENING ENGINE — Orchestrator-driven call routing
+// ============================================================
+
+class CallScreeningEngine {
+
+  /**
+   * Entry point: called when the AI detects "user wants to speak to agent"
+   * via the transfer_to_human tool OR a screening_call tool.
+   */
+  static async initiateScreening(session, args) {
+    if (session.screeningActive || session.screeningResolved) {
+      logger.warn("[SCREENING] Already active or resolved", { callSid: session.callSid });
+      return { success: false, error: "Screening already in progress" };
+    }
+
+    session.screeningActive = true;
+    const customerPhone = session.customerPhone || session.fromNumber || "";
+    const customerName = args?.customer_name || args?.customerName || session.preloadedContact?.safeName || "";
+    const customerCompany = args?.customer_company || args?.customerCompany || "";
+    const reasonSummary = args?.reason || args?.reason_summary || "";
+
+    logger.info("[SCREENING] Initiating orchestrator call", {
+      callSid: session.callSid,
+      agentId: session.agentId,
+      companyId: session.companyId,
+      customerName,
+    });
+
+    try {
+      // 1. Call the orchestrator
+      const orchResponse = await fetch(SCREENING_ORCHESTRATOR_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
+        },
+        body: JSON.stringify({
+          provider_call_sid: session.callSid,
+          company_id: session.companyId,
+          agent_id: session.agentId,
+          customer_name: customerName,
+          customer_company: customerCompany,
+          customer_phone: customerPhone,
+          reason_summary: reasonSummary,
+          language: session.language || DEFAULT_LANGUAGE,
+        }),
+      });
+
+      if (!orchResponse.ok) {
+        const errText = await orchResponse.text();
+        logger.error("[SCREENING] Orchestrator error", { status: orchResponse.status, body: errText });
+        session.screeningActive = false;
+        return { success: false, error: "Orchestrator failed" };
+      }
+
+      const orch = await orchResponse.json();
+      logger.info("[SCREENING] Orchestrator response", {
+        callSid: session.callSid,
+        strategy: orch.routing_strategy,
+        callId: orch.call_id,
+        priority: orch.classification?.priority,
+        isVip: orch.classification?.is_vip,
+      });
+
+      session.screeningCallId = orch.call_id;
+      session.screeningVoicecoreId = orch.voicecore_call_id;
+      session.screeningStrategy = orch.routing_strategy;
+      session.screeningHoldMessages = orch.hold_messages || [];
+
+      // 2. Branch based on routing strategy
+      switch (orch.routing_strategy) {
+        case "ai_only":
+          return await this._handleAiOnly(session, orch);
+
+        case "bypass":
+          return await this._handleBypass(session, orch);
+
+        case "parallel":
+          return await this._handleParallel(session, orch);
+
+        case "standard":
+        default:
+          return await this._handleStandard(session, orch);
+      }
+
+    } catch (error) {
+      logger.error("[SCREENING] Exception", { callSid: session.callSid, error: error.message });
+      session.screeningActive = false;
+      // Failsafe: tell AI to continue
+      this._injectAiFailsafe(session);
+      return { success: false, error: error.message };
+    }
+  }
+
+  // ==================== STRATEGY HANDLERS ====================
+
+  static async _handleAiOnly(session, orch) {
+    logger.info("[SCREENING] AI-only mode — agent unavailable", { callSid: session.callSid });
+    session.screeningResolved = true;
+
+    if (orch.ai_resume?.resume) {
+      this._injectAiResume(session, orch.ai_resume.resume);
+    } else {
+      this._injectAiFailsafe(session);
+    }
+
+    return { success: true, action: "ai_only", voicecore_call_id: orch.voicecore_call_id };
+  }
+
+  static async _handleBypass(session, orch) {
+    logger.info("[SCREENING] VIP bypass — direct connection", { callSid: session.callSid });
+
+    // Tell AI to announce the transfer
+    const lang = session.language === "es" ? "es" : "en";
+    const msg = lang === "es"
+      ? "Le estoy conectando ahora mismo. Un momento por favor."
+      : "I'm connecting you right now. One moment please.";
+
+    this._injectSystemMessage(session, msg);
+
+    // Bridge is already triggered by orchestrator for bypass
+    session.screeningResolved = true;
+    return { success: true, action: "bypass", voicecore_call_id: orch.voicecore_call_id };
+  }
+
+  static async _handleParallel(session, orch) {
+    logger.info("[SCREENING] Parallel routing — WebRTC + PSTN simultaneously", { callSid: session.callSid });
+
+    // Tell AI to say "checking availability"
+    const firstHold = session.screeningHoldMessages[0] || "Give me a moment while I check availability.";
+    this._injectSystemMessage(session, firstHold);
+
+    // PSTN already triggered by orchestrator
+    // Start hold loop + poll for agent response
+    this._startHoldLoop(session);
+    this._startAgentResponsePoll(session, orch.orchestration?.webrtc_timeout_seconds || 20);
+
+    return { success: true, action: "parallel_routing", voicecore_call_id: orch.voicecore_call_id };
+  }
+
+  static async _handleStandard(session, orch) {
+    logger.info("[SCREENING] Standard routing — WebRTC first", {
+      callSid: session.callSid,
+      timeout: orch.orchestration?.webrtc_timeout_seconds,
+    });
+
+    // Tell AI to say first hold message
+    const firstHold = session.screeningHoldMessages[0] || "Give me a moment while I check availability.";
+    this._injectSystemMessage(session, firstHold);
+
+    // Start hold loop
+    this._startHoldLoop(session);
+
+    // Start polling for agent response + set timeout
+    const timeout = orch.orchestration?.webrtc_timeout_seconds || 10;
+    this._startAgentResponsePoll(session, timeout);
+
+    return { success: true, action: "standard_routing", voicecore_call_id: orch.voicecore_call_id };
+  }
+
+  // ==================== HOLD LOOP ENGINE ====================
+
+  static _startHoldLoop(session) {
+    if (session.screeningHoldTimer) return;
+    session.screeningHoldIndex = 1; // Index 0 already played
+
+    session.screeningHoldTimer = setInterval(() => {
+      if (session.screeningResolved || session.callEnding || session.sessionDestroyed) {
+        this._stopScreeningTimers(session);
+        return;
+      }
+
+      const messages = session.screeningHoldMessages;
+      if (messages.length === 0) return;
+
+      const idx = session.screeningHoldIndex % messages.length;
+      const msg = messages[idx];
+      session.screeningHoldIndex++;
+
+      logger.debug("[SCREENING] Hold message", { callSid: session.callSid, idx, msg: msg.substring(0, 50) });
+      this._injectSystemMessage(session, msg);
+    }, HOLD_MESSAGE_INTERVAL_MS);
+  }
+
+  // ==================== AGENT RESPONSE POLLING ====================
+
+  static _startAgentResponsePoll(session, timeoutSeconds) {
+    // Poll Supabase for status changes on voicecore_calls
+    session.screeningPollTimer = setInterval(async () => {
+      if (session.screeningResolved || session.callEnding) {
+        this._stopScreeningTimers(session);
+        return;
+      }
+
+      try {
+        const res = await fetch(
+          `${SUPABASE_URL}/rest/v1/voicecore_calls?id=eq.${session.screeningCallId}&select=status,agent_responded_at`,
+          {
+            headers: {
+              "apikey": SUPABASE_SERVICE_KEY,
+              "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
+            },
+          }
+        );
+
+        if (!res.ok) return;
+        const data = await res.json();
+        const call = data?.[0];
+        if (!call) return;
+
+        // Check if agent has responded
+        const resolvedStatuses = ["accepted", "rejected", "message", "callback"];
+        if (resolvedStatuses.includes(call.status)) {
+          logger.info("[SCREENING] Agent responded", {
+            callSid: session.callSid,
+            status: call.status,
+            callId: session.screeningCallId,
+          });
+          await this._handleAgentResponse(session, call.status);
+        }
+      } catch (e) {
+        logger.warn("[SCREENING] Poll error", { error: e.message });
+      }
+    }, SCREENING_POLL_INTERVAL_MS);
+
+    // Timeout: trigger PSTN fallback or AI resume
+    session.screeningTimeoutTimer = setTimeout(async () => {
+      if (session.screeningResolved || session.callEnding) return;
+
+      logger.info("[SCREENING] Timeout reached", {
+        callSid: session.callSid,
+        timeoutSeconds,
+        strategy: session.screeningStrategy,
+      });
+
+      // Call the timeout edge function (handles PSTN fallback)
+      try {
+        const timeoutRes = await fetch(SCREENING_TIMEOUT_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
+          },
+          body: JSON.stringify({ call_id: session.screeningCallId }),
+        });
+
+        const timeoutData = await timeoutRes.json();
+        logger.info("[SCREENING] Timeout result", { callSid: session.callSid, data: timeoutData });
+
+        // If PSTN was triggered, extend polling
+        if (timeoutData.pstn_triggered) {
+          logger.info("[SCREENING] PSTN fallback triggered, extending poll", { callSid: session.callSid });
+          // Continue polling — will resolve when PSTN picks up or times out
+        } else {
+          // No PSTN — go to AI resume
+          await this._resolveWithAiResume(session);
+        }
+      } catch (e) {
+        logger.error("[SCREENING] Timeout handler error", { callSid: session.callSid, error: e.message });
+        await this._resolveWithAiResume(session);
+      }
+    }, timeoutSeconds * 1000);
+  }
+
+  // ==================== AGENT RESPONSE HANDLING ====================
+
+  static async _handleAgentResponse(session, status) {
+    if (session.screeningResolved) return;
+    session.screeningResolved = true;
+    this._stopScreeningTimers(session);
+
+    if (status === "accepted") {
+      // Agent accepted — bridge the call
+      logger.info("[SCREENING] Agent accepted — bridging", { callSid: session.callSid });
+
+      const lang = session.language === "es" ? "es" : "en";
+      const connectMsg = lang === "es"
+        ? "Le estoy conectando ahora."
+        : "I'm connecting you now.";
+      this._injectSystemMessage(session, connectMsg);
+
+      // The bridge is triggered by call-screening-respond
+      // Gateway just needs to confirm the call stays alive
+
+    } else {
+      // Agent rejected/message/callback — resume AI
+      logger.info("[SCREENING] Agent non-accept, resuming AI", {
+        callSid: session.callSid,
+        status,
+      });
+      await this._resolveWithAiResume(session);
+    }
+  }
+
+  // ==================== AI RESUME ====================
+
+  static async _resolveWithAiResume(session) {
+    if (session.screeningResolved && !session.screeningCallId) return;
+    session.screeningResolved = true;
+    this._stopScreeningTimers(session);
+
+    try {
+      const resumeRes = await fetch(SCREENING_AI_RESUME_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
+        },
+        body: JSON.stringify({ call_id: session.screeningCallId }),
+      });
+
+      if (resumeRes.ok) {
+        const resumeData = await resumeRes.json();
+        if (resumeData.resume) {
+          this._injectAiResume(session, resumeData.resume);
+          return;
+        }
+      }
+    } catch (e) {
+      logger.error("[SCREENING] AI resume fetch error", { error: e.message });
+    }
+
+    // Fallback
+    this._injectAiFailsafe(session);
+  }
+
+  // ==================== OPENAI INJECTION HELPERS ====================
+
+  static _injectSystemMessage(session, message) {
+    if (!session.openaiWs || session.openaiWs.readyState !== WebSocket.OPEN) return;
+    if (session.callEnding || session.sessionDestroyed) return;
+
+    session.openaiWs.send(JSON.stringify({
+      type: "conversation.item.create",
+      item: {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: `[SYSTEM] Say exactly: "${message}" — Do NOT add anything else.` }],
+      },
+    }));
+
+    ResponseLockManager.sendResponseCreateSafe(
+      session,
+      { type: "response.create", response: { modalities: ["text", "audio"] } },
+      "screening_hold"
+    );
+  }
+
+  static _injectAiResume(session, resume) {
+    if (!session.openaiWs || session.openaiWs.readyState !== WebSocket.OPEN) return;
+    if (session.callEnding || session.sessionDestroyed) return;
+
+    // Build a comprehensive instruction for the AI to continue naturally
+    let instruction = `[SYSTEM - CALL SCREENING RESULT]\n`;
+    instruction += `The agent is unavailable. Continue the conversation naturally.\n`;
+    instruction += `Say this to the caller: "${resume.ai_script}"\n`;
+
+    if (resume.follow_up_prompts?.length > 0) {
+      instruction += `Then offer these options naturally (don't list them robotically):\n`;
+      resume.follow_up_prompts.forEach((p, i) => {
+        instruction += `- ${p}\n`;
+      });
+    }
+
+    if (resume.collect_data) {
+      instruction += `\nYou need to collect: ${resume.collect_data.type}\n`;
+      instruction += `Ask: "${resume.collect_data.prompt}"\n`;
+    }
+
+    instruction += `\nIMPORTANT: Continue the same conversation naturally. Do NOT restart or re-greet.`;
+
+    session.openaiWs.send(JSON.stringify({
+      type: "conversation.item.create",
+      item: {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: instruction }],
+      },
+    }));
+
+    ResponseLockManager.sendResponseCreateSafe(
+      session,
+      { type: "response.create", response: { modalities: ["text", "audio"] } },
+      "screening_ai_resume"
+    );
+
+    logger.info("[SCREENING] AI resume injected", {
+      callSid: session.callSid,
+      action: resume.action,
+    });
+  }
+
+  static _injectAiFailsafe(session) {
+    const lang = session.language === "es" ? "es" : "en";
+    const failsafeMsg = lang === "es"
+      ? "Hubo un inconveniente al conectar la llamada, pero puedo ayudarle o tomar un mensaje."
+      : "Something went wrong connecting the call, but I can help you or take a message.";
+
+    this._injectSystemMessage(session, failsafeMsg);
+    logger.warn("[SCREENING] Failsafe injected", { callSid: session.callSid });
+  }
+
+  // ==================== CUSTOMER HANGUP ====================
+
+  static async handleCustomerHangup(session) {
+    if (!session.screeningActive || !session.screeningCallId) return;
+
+    logger.info("[SCREENING] Customer hangup during screening", {
+      callSid: session.callSid,
+      callId: session.screeningCallId,
+    });
+
+    this._stopScreeningTimers(session);
+
+    // Notify hangup edge function (cancels PSTN, updates DB)
+    try {
+      await fetch(SCREENING_HANGUP_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
+        },
+        body: JSON.stringify({
+          call_id: session.screeningCallId,
+          provider_call_sid: session.callSid,
+        }),
+      });
+    } catch (e) {
+      logger.error("[SCREENING] Hangup notification failed", { error: e.message });
+    }
+  }
+
+  // ==================== CLEANUP ====================
+
+  static _stopScreeningTimers(session) {
+    if (session.screeningHoldTimer) {
+      clearInterval(session.screeningHoldTimer);
+      session.screeningHoldTimer = null;
+    }
+    if (session.screeningPollTimer) {
+      clearInterval(session.screeningPollTimer);
+      session.screeningPollTimer = null;
+    }
+    if (session.screeningTimeoutTimer) {
+      clearTimeout(session.screeningTimeoutTimer);
+      session.screeningTimeoutTimer = null;
+    }
+  }
+}
   static record(session, toolName, args, result, durationMs) {
     if (!session.toolCallLog) session.toolCallLog = [];
     session.toolCallLog.push({
@@ -2320,6 +2798,46 @@ class ToolExecutor {
     session.transferInProgress = true;
 
     try {
+      // ==================== NEW: Use Call Screening Engine ====================
+      const result = await CallScreeningEngine.initiateScreening(session, {
+        customer_name: session.preloadedContact?.safeName || args?.customer_name || "",
+        customer_company: args?.customer_company || "",
+        reason_summary: args?.reason || args?.reason_summary || "",
+      });
+
+      if (!result.success) {
+        // Fallback to legacy transfer if screening fails
+        logger.warn("[TRANSFER] Screening failed, falling back to legacy", {
+          callSid: session.callSid,
+          error: result.error,
+        });
+        session.transferInProgress = false;
+        return await this._executeLegacyTransfer(session, args);
+      }
+
+      return {
+        success: true,
+        action: result.action,
+        voicecore_call_id: result.voicecore_call_id,
+        message: "Call screening initiated. The system is checking agent availability.",
+      };
+
+    } catch (error) {
+      session.transferInProgress = false;
+      logger.error("[TRANSFER] Screening exception, falling back", { error: error.message });
+      return await this._executeLegacyTransfer(session, args);
+    }
+  }
+
+  static async _executeLegacyTransfer(session, args) {
+    // FIX #8: Prevent double execution
+    if (session.transferInProgress) {
+      logger.warn("Transfer already in progress, ignoring duplicate call", { callSid: session.callSid });
+      return { success: false, error: "Transfer already in progress" };
+    }
+    session.transferInProgress = true;
+
+    try {
       // 1. Resolve target via agent-router edge function (availability-aware)
       const target = await resolveTransferTarget(session, args);
       if (!target) {
@@ -2978,6 +3496,10 @@ class TwilioHandler {
 
     twilioWs.on("close", () => {
       logger.info("Twilio WebSocket closed", { sessionId, callSid: session.callSid });
+      // NEW: Handle screening hangup
+      if (session.screeningActive) {
+        CallScreeningEngine.handleCustomerHangup(session).catch(() => {});
+      }
 
       // ✅ FAIL-SAFE: Release agent lock on WS close (covers all disconnect scenarios)
       const _closeSid = session?.callSid || session?.twilioCallSid;
@@ -3297,6 +3819,13 @@ OUTPUT FORMAT:
   static async _handleStop(session) {
     logger.info("Twilio stream stopped", { callSid: session.callSid });
     session.metrics.t_call_ended = Date.now();
+
+    // NEW: Notify screening system of customer hangup
+    if (session.screeningActive) {
+      CallScreeningEngine.handleCustomerHangup(session).catch(e =>
+        logger.warn("[SCREENING] Hangup notification failed", { error: e.message })
+      );
+    }
 
     if (session.openaiWs?.readyState === WebSocket.OPEN) {
       session.openaiWs.close(1000, "stream_stopped");
@@ -4072,5 +4601,7 @@ export {
   TwilioHandler,
   // Observability
   MetricsCollector,
-  HealthCheck
+  HealthCheck,
+  // Phase 4: Call Screening
+  CallScreeningEngine,    // Phase 4
 };
