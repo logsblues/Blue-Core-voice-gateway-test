@@ -3198,7 +3198,13 @@ class OpenAIHandler {
         case "response.audio_transcript.done":
           if (event.transcript) {
             session.transcripts.assistant.push(event.transcript);
-            session.aiTurnCount = (session.aiTurnCount || 0) + 1; // ✅ v6.3.0 POINT D
+            // ── v7.3.6 FIX: Only count as AI turn if it produced actual speech (not just a tool call) ──
+            const hasAudio = event.response?.output?.some(o => o.type === "audio");
+            const hasToolCall = event.response?.output?.some(o => o.type === "function_call");
+            if (hasAudio && !hasToolCall) {
+              session.aiTurnCount = (session.aiTurnCount || 0) + 1; // ✅ v6.3.0 POINT D
+            }
+            // ── end fix ──
             logger.debug("Assistant transcript", { callSid: session.callSid, transcript: event.transcript.substring(0, 100) });
             if (!session.callEnding) {
               AutoHangupManager.checkForGoodbye(session, event.transcript);
@@ -3208,8 +3214,9 @@ class OpenAIHandler {
             // so it fires even when userCount=0 (voicemail box produces no transcript).
             // Previous location (inside user transcript handler) never fired when
             // OpenAI Whisper produced 0 user transcripts from the voicemail audio.
+            const elapsedMs = Date.now() - (session.callStartTime || Date.now());
             if (!session.voicemailHandled && !session.callEnding &&
-                session.aiTurnCount >= 2 && (session.userTurnCount || 0) === 0) {
+                session.aiTurnCount >= 4 && (session.userTurnCount || 0) === 0 && elapsedMs > 20000) {
               logger.warn("Monologue detection (AI-side): treating as voicemail", {
                 callSid: session.callSid,
                 aiTurns: session.aiTurnCount,
@@ -3555,6 +3562,7 @@ class TwilioHandler {
   static async _handleStart(session, message, urlParams) {
     session.streamSid = message.streamSid;
     session.callSid = message.start.callSid;
+    session.callStartTime = Date.now(); // ── v7.3.6 FIX: record call start for monologue detection ──
     session.twilioOwnerSid = message.start.accountSid || null;
     const params = message.start.customParameters || {};
 
