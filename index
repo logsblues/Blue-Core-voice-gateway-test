@@ -2620,6 +2620,94 @@ async function releaseAgentOnCallEnd(session) {
   }
 }
 
+// ============================================================
+// ENFORCEMENT ORCHESTRATOR — Generic turn-level enforcement
+// No vertical/business logic lives here. Backend decides all.
+// ============================================================
+
+class EnforcementOrchestrator {
+  constructor({ enforcement, callContext, logger: log }) {
+    this.enforcement = enforcement || { enabled: false };
+    this.ctx = callContext; // { call_sid, agent_id, company_id, customer_phone, language }
+    this.log = log;
+    this.toolsExecutedThisTurn = new Set();
+    this.lastUserTranscript = '';
+  }
+
+  get enabled() { return !!this.enforcement.enabled; }
+
+  resetTurn(userTranscript) {
+    this.toolsExecutedThisTurn.clear();
+    this.lastUserTranscript = userTranscript || '';
+  }
+
+  trackToolExecuted(name) {
+    if (name) this.toolsExecutedThisTurn.add(name);
+  }
+
+  async _post(payload) {
+    const url = this.enforcement.enforcer_endpoint;
+    if (!url) return { action: 'allow', reason: 'no_endpoint' };
+    try {
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY}`,
+        },
+        body: JSON.stringify(payload),
+      });
+      return await r.json();
+    } catch (err) {
+      this.log.warn('[enforcement] fail-open', { err: err.message });
+      return { action: 'allow', reason: 'enforcer_network_error' };
+    }
+  }
+
+  // Called AFTER user transcript is finalized,
+  // BEFORE the gateway triggers response.create on OpenAI.
+  async preResponse() {
+    if (!this.enabled) return { action: 'allow' };
+    const decision = await this._post({
+      mode: 'pre_response',
+      call_sid: this.ctx.call_sid,
+      agent_id: this.ctx.agent_id,
+      company_id: this.ctx.company_id,
+      customer_phone: this.ctx.customer_phone,
+      user_transcript: this.lastUserTranscript,
+    });
+    this.log.info('[enforcement] pre_response', {
+      call_sid: this.ctx.call_sid,
+      action: decision.action,
+      reason: decision.reason,
+      tool_name: decision.tool_name,
+    });
+    return decision;
+  }
+
+  // Called AFTER model produced a response,
+  // BEFORE audio is flushed to Twilio.
+  async postResponseCheck(assistantText) {
+    if (!this.enabled) return { action: 'allow' };
+    const decision = await this._post({
+      mode: 'post_response_check',
+      call_sid: this.ctx.call_sid,
+      agent_id: this.ctx.agent_id,
+      company_id: this.ctx.company_id,
+      customer_phone: this.ctx.customer_phone,
+      assistant_text: assistantText || '',
+      tools_executed_in_turn: [...this.toolsExecutedThisTurn],
+    });
+    this.log.info('[enforcement] post_response_check', {
+      call_sid: this.ctx.call_sid,
+      action: decision.action,
+      reason: decision.reason,
+      blocked_phrase: decision.blocked_phrase,
+    });
+    return decision;
+  }
+}
+
 class ToolExecutor {
   static getCustomerPhone(session, args) {
     const phone = args.phone || session.customerPhone ||
@@ -3291,9 +3379,30 @@ class OpenAIHandler {
               });
               await VoicemailDetector.handleDetection(session);
             }
+            // ── EnforcementOrchestrator HOOK 1: preResponse ──
+            if (session.enforcer) {
+              session.enforcer.resetTurn(event.transcript);
+              const enfDecision = await session.enforcer.preResponse();
+              if (enfDecision.action === 'force_tool') {
+                // Backend wants to bias the response toward a specific tool
+                ResponseLockManager.sendResponseCreateSafe(
+                  session,
+                  {
+                    type: 'response.create',
+                    response: {
+                      modalities: ['text', 'audio'],
+                      tool_choice: enfDecision.tool_choice,
+                    },
+                  },
+                  'enforcement_force_tool'
+                );
+                break; // skip default response.create flow
+              }
+              // action === 'allow' → fall through to normal flow
+            }
+            // ── end enforcement hook 1 ──
           }
           break;
-
         case "response.created":
           session._hasActiveResponse = true; // ✅ v7.3.4: track active response
           break;
@@ -3321,21 +3430,56 @@ class OpenAIHandler {
                     }]
                   }
                 }));
-                session.openaiWs.send(JSON.stringify({ type: "response.create" }));
+                 session.openaiWs.send(JSON.stringify({ type: "response.create" }));
                 logger.info("[v7.3.4] Deferred voicemail script injected", { callSid: session.callSid });
               }
             }
           }
+          // ── EnforcementOrchestrator HOOK 3: postResponseCheck ──
+          if (session.enforcer) {
+            const assistantText = session.transcripts.assistant[session.transcripts.assistant.length - 1] || '';
+            const enfPostDecision = await session.enforcer.postResponseCheck(assistantText);
+            if (enfPostDecision.action === 'block_response') {
+              // Cancel any audio still streaming to Twilio
+              if (session.twilioWs?.readyState === WebSocket.OPEN && session.streamSid) {
+                session.twilioWs.send(JSON.stringify({ event: 'clear', streamSid: session.streamSid }));
+              }
+              // Pick replacement text by language; backend supplies both
+              const replacement = (session.language === 'es')
+                ? enfPostDecision.replacement_text_es
+                : enfPostDecision.replacement_text_en;
+              if (replacement) {
+                // Inject replacement via OpenAI so it uses the agent voice
+                if (session.openaiWs?.readyState === WebSocket.OPEN) {
+                  session.openaiWs.send(JSON.stringify({
+                    type: 'conversation.item.create',
+                    item: {
+                      type: 'message',
+                      role: 'user',
+                      content: [{ type: 'input_text', text: `[SYSTEM] Say EXACTLY: "${replacement}"` }],
+                    },
+                  }));
+                  ResponseLockManager.sendResponseCreateSafe(
+                    session,
+                    { type: 'response.create', response: { modalities: ['text', 'audio'] } },
+                    'enforcement_replacement'
+                  );
+                }
+              }
+            }
+          }
+          // ── end enforcement hook 3 ──
           break;
-
         case "response.cancelled":
           session._hasActiveResponse = false; // ✅ v7.3.4: cancelled also clears active state
           break;
 
-        case "response.function_call_arguments.done":
+         case "response.function_call_arguments.done":
+          // ── EnforcementOrchestrator HOOK 2: track tool execution ──
+          if (session.enforcer) session.enforcer.trackToolExecuted(event.name);
+          // ── end enforcement hook 2 ──
           await ToolExecutor.execute(session, event.name, event.call_id, Parser.safeJsonParse(event.arguments, {}));
           break;
-
         case "error":
           logger.error("OpenAI error", { callSid: session.callSid, error: JSON.stringify(event.error) });
           break;
@@ -3767,10 +3911,26 @@ class TwilioHandler {
       session.agentId,
       session.language || session.config?.language || DEFAULT_LANGUAGE
     );
-    if (playbook) {
+     if (playbook) {
       session.playbook = playbook;
     }
-
+    // ── EnforcementOrchestrator: init after config is ready ──
+    session.enforcer = new EnforcementOrchestrator({
+      enforcement: session.config?.enforcement,
+      callContext: {
+        call_sid: session.callSid,
+        agent_id: session.agentId,
+        company_id: session.companyId,
+        customer_phone: session.customerPhone || session.fromNumber || '',
+        language: session.language || session.config?.language || DEFAULT_LANGUAGE,
+      },
+      logger,
+    });
+    logger.info('[enforcement] orchestrator initialized', {
+      callSid: session.callSid,
+      enabled: session.enforcer.enabled,
+    });
+    // ── end enforcer init ──
     // ==================== INTERPRETER MODE CHECK ====================
     if (session.callMode === "interpreter" && session.interpreterEnabled) {
       logger.info("Interpreter mode activated", {
@@ -4664,4 +4824,6 @@ export {
   HealthCheck,
   // Phase 4: Call Screening
   CallScreeningEngine,    // Phase 4
+  // Enforcement
+  EnforcementOrchestrator, // Generic turn-level enforcement
 };
