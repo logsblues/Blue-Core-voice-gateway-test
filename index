@@ -1109,6 +1109,8 @@ class SupabaseClient {
               tool_choice_default: 'auto',
             };
           }
+          // Also store industry on config for downstream fallback checks
+          config.industry = bcAgent.industry || bcAgent.vertical || null;
 
           logger.info("[enforcement] loaded into agent config", {
             agentId,
@@ -2760,6 +2762,19 @@ class ToolExecutor {
     let result;
 
     try {
+      // ── CAMBIO 3: Block end_call if restaurant order was not created ──
+      if (toolName === 'end_call' && session.restaurantOrderFailed) {
+        logger.warn('[restaurant] end_call_blocked_order_not_created', {
+          callSid: session.callSid,
+          reason: session.restaurantOrderFailureReason
+        });
+        result = {
+          success: false,
+          blocked: true,
+          error: 'order_not_created',
+          instruction: 'Do not end the call. Tell the customer the order needs restaurant review because it could not be finalized.'
+        };
+      } else
       if (toolName === "end_call") {
         // ✅ v6.3.0 POINT C: If AI calls end_call during voicemail mode, force hangup
         if (session.isVoicemailMode) {
@@ -2792,6 +2807,30 @@ class ToolExecutor {
           companyId: session.companyId, agentId: session.agentId,
           callSid: session.callSid, customerPhone: phone, direction: session.direction
         });
+        // ── CAMBIO 2+4: Track create_restaurant_order failure and log operational event ──
+        if (toolName === 'create_restaurant_order' && result?.success === false) {
+          session.restaurantOrderFailed = true;
+          session.restaurantOrderFailureReason = result?.error || result?.reason || 'create_restaurant_order_failed';
+          logger.error('[restaurant] create_order_failed_blocking_close', {
+            callSid: session.callSid,
+            reason: session.restaurantOrderFailureReason
+          });
+          // CAMBIO 4: Log operational event for review
+          logger.error('[restaurant] operational_event', {
+            callSid: session.callSid,
+            event_type: 'create_order_failed',
+            system_decision: 'block_end_call',
+            next_state: 'needs_review',
+            reason: session.restaurantOrderFailureReason
+          });
+        }
+        if (toolName === 'create_restaurant_order' && result?.success === true) {
+          session.restaurantOrderFailed = false;
+          logger.info('[restaurant] create_order_success', { callSid: session.callSid });
+        }
+        if (toolName === 'upsert_restaurant_order_draft' && result?.success === true) {
+          logger.info('[restaurant] upsert_draft_success', { callSid: session.callSid });
+        }
       }
     } catch (error) {
       result = { success: false, error: error.message };
