@@ -1029,6 +1029,7 @@ class SupabaseClient {
       sttProvider: "openai",
       sttLanguage: "es",
       sttModel: "whisper-1",
+      enforcement: null,  // populated from bc_agents.enforcement or vertical fallback
       _ts: Date.now()
     };
 
@@ -1094,6 +1095,27 @@ class SupabaseClient {
           config.sttProvider = bcAgent.stt_provider || "openai";
           config.sttLanguage = bcAgent.stt_language || config.language;
           config.sttModel = bcAgent.stt_model || "whisper-1";
+
+          // Enforcement blob (opaque — backend decides all logic)
+          if (bcAgent.enforcement) {
+            config.enforcement = bcAgent.enforcement;
+          } else if (bcAgent.industry === 'restaurant' || bcAgent.vertical === 'restaurant') {
+            // Fallback for restaurant vertical without explicit enforcement config
+            config.enforcement = {
+              enabled: true,
+              vertical: 'restaurant',
+              enforcer_endpoint: `${SUPABASE_URL}/functions/v1/voice-turn-enforcer`,
+              enforcer_modes: ['pre_response', 'post_response_check'],
+              tool_choice_default: 'auto',
+            };
+          }
+
+          logger.info("[enforcement] loaded into agent config", {
+            agentId,
+            companyId,
+            enabled: config.enforcement?.enabled,
+            endpoint: config.enforcement?.enforcer_endpoint,
+          });
 
           logger.info("Agent loaded from bc_agents", {
             agentId,
@@ -3897,6 +3919,11 @@ class TwilioHandler {
       session.config = config;
       session.configReady = true;
     }
+    // [DIAG] Log 1: what did loadAgentConfig return for enforcement?
+    logger.info("[debug enforcement config loaded]", {
+      hasEnforcement: !!session.config?.enforcement,
+      enforcement: session.config?.enforcement || null,
+    });
 
     // Pre-resolve Twilio owner token for transfer (fix 404)
     session.twilioOwnerToken = await ToolExecutor._resolveTwilioTokenForOwner(session);
@@ -3914,6 +3941,11 @@ class TwilioHandler {
      if (playbook) {
       session.playbook = playbook;
     }
+    // [DIAG] Log 2: what is enforcement right before creating the orchestrator?
+    logger.info("[debug enforcement before orchestrator]", {
+      enabled: session.config?.enforcement?.enabled,
+      endpoint: session.config?.enforcement?.enforcer_endpoint,
+    });
     // ── EnforcementOrchestrator: init after config is ready ──
     session.enforcer = new EnforcementOrchestrator({
       enforcement: session.config?.enforcement,
