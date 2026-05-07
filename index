@@ -3985,6 +3985,20 @@ class TwilioHandler {
       enabled: session.config?.enforcement?.enabled,
       endpoint: session.config?.enforcement?.enforcer_endpoint,
     });
+    // ── Prewarm enforcement propagation: ensure enforcement is not lost on prewarm reuse ──
+    if (session.config && !session.config.enforcement) {
+      session.config.enforcement =
+        prewarmSession?.enforcement
+        || prewarmSession?.config?.enforcement
+        || session.config?.enforcement
+        || null;
+    }
+    logger.info('[enforcement] prewarm reuse config', {
+      callSid: session.callSid,
+      hasPrewarmEnforcement: !!(prewarmSession?.enforcement || prewarmSession?.config?.enforcement),
+      hasSessionEnforcement: !!session.config?.enforcement,
+      enabled: session.config?.enforcement?.enabled,
+    });
     // ── EnforcementOrchestrator: init after config is ready ──
     session.enforcer = new EnforcementOrchestrator({
       enforcement: session.config?.enforcement,
