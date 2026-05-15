@@ -1193,6 +1193,19 @@ class SupabaseClient {
           openingGreeting: prep.opening_greeting || null,
           strictVoicemailMode: prep.strict_voicemail_mode || false,
         };
+        // ✅ NEW: read additional realtime tools persisted by render-gateway-twiml
+        try {
+          const topic = prep.topic ? JSON.parse(prep.topic) : null;
+          const extra = topic?.tool_metadata?.additional_tools;
+          if (Array.isArray(extra) && extra.length > 0) {
+            session.additionalTools = extra;
+            logger.info("Prep additional_tools loaded from topic", {
+              prepId, count: extra.length, names: extra.map(t => t?.name).filter(Boolean)
+            });
+          }
+        } catch (parseErr) {
+          logger.warn("Prep topic JSON parse failed", { prepId, error: parseErr.message });
+        }
         logger.info("Prep loaded from call_prep_sessions", { prepId, hasInstructions: !!session.dynamicInstructions, callMode: session.callMode || "ai_agent", hasVoicemailScript: !!prep.voicemail_script });
         return;
       }
@@ -1219,6 +1232,19 @@ class SupabaseClient {
           openingGreeting: bcPrep.opening_greeting || null,
           strictVoicemailMode: bcPrep.strict_voicemail_mode || false,
         };
+        // ✅ NEW: read additional realtime tools persisted by render-gateway-twiml
+        try {
+          const topic = bcPrep.topic ? JSON.parse(bcPrep.topic) : null;
+          const extra = topic?.tool_metadata?.additional_tools;
+          if (Array.isArray(extra) && extra.length > 0) {
+            session.additionalTools = extra;
+            logger.info("Prep additional_tools loaded from topic (bc)", {
+              prepId, count: extra.length, names: extra.map(t => t?.name).filter(Boolean)
+            });
+          }
+        } catch (parseErr) {
+          logger.warn("Prep topic JSON parse failed (bc)", { prepId, error: parseErr.message });
+        }
         logger.info("Prep loaded from bc_call_prep_sessions", { prepId, callMode: session.callMode || "ai_agent", hasVoicemailScript: !!bcPrep.voicemail_script });
       }
     } catch (e) {
@@ -3180,22 +3206,22 @@ class ToolExecutor {
    * ENHANCED v7: Uses dynamic tools from bc_agent_tools if loaded, otherwise hardcoded defaults
    */
   static buildToolDefinitions(session, config) {
-    // v7.2.0: If dynamicTools is an empty array, return NO tools (interpreter/no-tools mode)
+    // v7.2.0: interpreter / no-tools mode
     if (Array.isArray(session.dynamicTools) && session.dynamicTools.length === 0) {
       logger.info("Using empty tool set (interpreter/no-tools mode)", { callSid: session.callSid });
       return [];
     }
 
-    // NEW v7: If dynamic tools were loaded from DB, convert them to OpenAI format
+    // ---------- 1) Build base tools (dynamic from DB OR hardcoded fallback) ----------
+    let baseTools = [];
+    let baseSource = "default";
+
     if (session.dynamicTools?.length > 0) {
-      const tools = session.dynamicTools
+      baseSource = "dynamic_db";
+      baseTools = session.dynamicTools
         .filter(t => t.schema)
         .map(t => {
-          // If schema is already in OpenAI format, use directly
-          if (t.schema.type === "function" && t.schema.function) {
-            return t.schema;
-          }
-          // Wrap in OpenAI format
+          if (t.schema.type === "function" && t.schema.function) return t.schema;
           return {
             type: "function",
             name: t.name,
@@ -3204,45 +3230,74 @@ class ToolExecutor {
           };
         });
 
-      // Always ensure end_call and transfer_to_human are available
-      const hasEndCall = tools.some(t => (t.name || t.function?.name) === "end_call");
-      const hasTransfer = tools.some(t => (t.name || t.function?.name) === "transfer_to_human");
-
+      const hasEndCall = baseTools.some(t => (t.name || t.function?.name) === "end_call");
+      const hasTransfer = baseTools.some(t => (t.name || t.function?.name) === "transfer_to_human");
       if (!hasEndCall) {
-        tools.push({ type: "function", name: "end_call", description: "End the call politely.", parameters: { type: "object", properties: { reason: { type: "string" }, outcome: { type: "string" }, goodbye_message: { type: "string" } } } });
+        baseTools.push({ type: "function", name: "end_call", description: "End the call politely.", parameters: { type: "object", properties: { reason: { type: "string" }, outcome: { type: "string" }, goodbye_message: { type: "string" } } } });
       }
       if (!hasTransfer) {
-        tools.push({ type: "function", name: "transfer_to_human", description: "Transfer call to a human agent.", parameters: { type: "object", properties: { agent_name: { type: "string" }, reason: { type: "string" } }, required: ["reason"] } });
+        baseTools.push({ type: "function", name: "transfer_to_human", description: "Transfer call to a human agent.", parameters: { type: "object", properties: { agent_name: { type: "string" }, reason: { type: "string" } }, required: ["reason"] } });
       }
-
-      logger.info("Using dynamic tools from DB", { count: tools.length });
-      return tools;
+    } else {
+      // hardcoded fallback (unchanged from v7.2.3)
+      const hasContact = session.preloadedContact?.name;
+      const isDemoCall = session.isDemoCall === true;
+      if (!hasContact) {
+        baseTools.push({ type: "function", name: "lookup_contact", description: "Look up contact by phone number.", parameters: { type: "object", properties: { phone: { type: "string" }, email: { type: "string" } } } });
+      }
+      baseTools.push({ type: "function", name: "create_or_merge_contact", description: "Create new contact or update existing.", parameters: { type: "object", properties: { phone: { type: "string" }, name: { type: "string" }, email: { type: "string" } }, required: ["phone", "name"] } });
+      baseTools.push({ type: "function", name: "create_lead", description: "Create a lead for opportunity tracking.", parameters: { type: "object", properties: { contact_id: { type: "string" }, phone: { type: "string" }, title: { type: "string" }, notes: { type: "string" }, temperature: { type: "string", enum: ["hot","warm","cold"] } }, required: ["title"] } });
+      if (!isDemoCall) {
+        baseTools.push({ type: "function", name: "schedule_appointment", description: "Schedule an appointment.", parameters: { type: "object", properties: { phone: { type: "string" }, name: { type: "string" }, start_at: { type: "string" }, title: { type: "string" }, notes: { type: "string" } }, required: ["start_at"] } });
+      }
+      baseTools.push({ type: "function", name: "check_appointments", description: "Check upcoming appointments.", parameters: { type: "object", properties: { phone: { type: "string" } }, required: ["phone"] } });
+      baseTools.push({ type: "function", name: "take_note", description: "Save a note about the call.", parameters: { type: "object", properties: { note: { type: "string" } }, required: ["note"] } });
+      baseTools.push({ type: "function", name: "send_message", description: "Send an SMS to the customer.", parameters: { type: "object", properties: { phone: { type: "string" }, message: { type: "string" } }, required: ["message"] } });
+      baseTools.push({ type: "function", name: "send_email", description: "Send an email.", parameters: { type: "object", properties: { email: { type: "string" }, subject: { type: "string" }, body: { type: "string" } }, required: ["subject","body"] } });
+      baseTools.push({ type: "function", name: "transfer_to_human", description: "Transfer call to a human agent.", parameters: { type: "object", properties: { agent_name: { type: "string" }, reason: { type: "string" } }, required: ["reason"] } });
+      baseTools.push({ type: "function", name: "end_call", description: "End the call politely.", parameters: { type: "object", properties: { reason: { type: "string" }, outcome: { type: "string" }, goodbye_message: { type: "string" } } } });
     }
 
-    // Fallback: hardcoded tool definitions (original v6.2.0 behavior)
-    const tools = [];
-    const hasContact = session.preloadedContact?.name;
-    const isDemoCall = session.isDemoCall === true;
+    const defaultToolCount = baseSource === "default" ? baseTools.length : 0;
+    const dynamicToolCount = baseSource === "dynamic_db" ? baseTools.length : 0;
 
-    if (!hasContact) {
-      tools.push({ type: "function", name: "lookup_contact", description: "Look up contact by phone number.", parameters: { type: "object", properties: { phone: { type: "string", description: "Phone number to search" }, email: { type: "string", description: "Email to search" } } } });
+    // ---------- 2) Merge additional_tools (generic, schema-validated, dedup by name) ----------
+    const rawAdditional = Array.isArray(session.additionalTools) ? session.additionalTools : [];
+    const additionalValid = [];
+    const additionalDropped = [];
+    for (const t of rawAdditional) {
+      const normalized = {
+        type: "function",
+        name: t?.name,
+        description: t?.description,
+        parameters: t?.parameters,
+      };
+      const ok =
+        typeof normalized.name === "string" && normalized.name.length > 0 &&
+        typeof normalized.description === "string" && normalized.description.length > 0 &&
+        normalized.parameters && typeof normalized.parameters === "object";
+      if (ok) additionalValid.push(normalized);
+      else additionalDropped.push(t?.name || "<unnamed>");
     }
 
-    tools.push({ type: "function", name: "create_or_merge_contact", description: "Create new contact or update existing.", parameters: { type: "object", properties: { phone: { type: "string" }, name: { type: "string" }, email: { type: "string" } }, required: ["phone", "name"] } });
-    tools.push({ type: "function", name: "create_lead", description: "Create a lead for opportunity tracking.", parameters: { type: "object", properties: { contact_id: { type: "string" }, phone: { type: "string" }, title: { type: "string" }, notes: { type: "string" }, temperature: { type: "string", enum: ["hot", "warm", "cold"] } }, required: ["title"] } });
+    // Dedup by name. Priority: additional > base.
+    const byName = new Map();
+    for (const t of baseTools) byName.set(t.name || t.function?.name, t);
+    for (const t of additionalValid) byName.set(t.name, t);
+    const finalTools = Array.from(byName.values());
 
-    if (!isDemoCall) {
-      tools.push({ type: "function", name: "schedule_appointment", description: "Schedule an appointment.", parameters: { type: "object", properties: { phone: { type: "string" }, name: { type: "string" }, start_at: { type: "string", description: "ISO datetime" }, title: { type: "string" }, notes: { type: "string" } }, required: ["start_at"] } });
-    }
+    logger.info("[realtime-tools] merged", {
+      callSid: session.callSid || "prewarm",
+      baseSource,
+      defaultToolCount,
+      dynamicToolCount,
+      additionalToolCount: additionalValid.length,
+      additionalToolNames: additionalValid.map(t => t.name),
+      droppedAdditional: additionalDropped,
+      finalToolCount: finalTools.length,
+    });
 
-    tools.push({ type: "function", name: "check_appointments", description: "Check upcoming appointments.", parameters: { type: "object", properties: { phone: { type: "string" } }, required: ["phone"] } });
-    tools.push({ type: "function", name: "take_note", description: "Save a note about the call.", parameters: { type: "object", properties: { note: { type: "string" } }, required: ["note"] } });
-    tools.push({ type: "function", name: "send_message", description: "Send an SMS to the customer.", parameters: { type: "object", properties: { phone: { type: "string" }, message: { type: "string" } }, required: ["message"] } });
-    tools.push({ type: "function", name: "send_email", description: "Send an email.", parameters: { type: "object", properties: { email: { type: "string" }, subject: { type: "string" }, body: { type: "string" } }, required: ["subject", "body"] } });
-    tools.push({ type: "function", name: "transfer_to_human", description: "Transfer call to a human agent.", parameters: { type: "object", properties: { agent_name: { type: "string" }, reason: { type: "string" } }, required: ["reason"] } });
-    tools.push({ type: "function", name: "end_call", description: "End the call politely.", parameters: { type: "object", properties: { reason: { type: "string" }, outcome: { type: "string" }, goodbye_message: { type: "string" } } } });
-
-    return tools;
+    return finalTools;
   }
 }
 
@@ -3616,6 +3671,7 @@ class OpenAIHandler {
       callSid: session.callSid || "prewarm",
       promptSource, promptLength: prompt.length,
       voice, toolCount: tools.length,
+      additionalToolCount: Array.isArray(session.additionalTools) ? session.additionalTools.length : 0,
       aiModel: config.aiModel,
       temperature: config.aiTemperature,
       sttModel: config.sttModel
@@ -3925,6 +3981,8 @@ class TwilioHandler {
       session.isDemoCall = prewarmSession.isDemoCall;
       // ✅ FIX 2 v7.2.7: Transfer voicemail config from prewarm session
       session.voicemailConfig = session.voicemailConfig || prewarmSession.voicemailConfig || null;
+      // ✅ NEW: carry additional realtime tools forward from prewarm
+      session.additionalTools = session.additionalTools || prewarmSession.additionalTools || null;
       session.language = session.language || prewarmSession.language;
       session.greetingMessageSent = false;
       session.sessionUpdated = false; // ✅ v7.3.0: reset for new session.update on prewarm reuse
@@ -4682,6 +4740,9 @@ const server = http.createServer(async (req, res) => {
             toolCallLog: [],
             dynamicTools: dynamicTools || null,  // NEW v7
             playbook: playbook || null,           // NEW v7
+            additionalTools: Array.isArray(data?.tool_metadata?.additional_tools)
+              ? data.tool_metadata.additional_tools
+              : (Array.isArray(data?.additional_tools) ? data.additional_tools : null),
             sessionCreated: false,
             sessionReady: false,
             greetingMessageSent: false,
@@ -4750,7 +4811,10 @@ const server = http.createServer(async (req, res) => {
                 session_ready: true,
                 timing_ms: Date.now() - prewarmStart,
                 dynamic_tools_loaded: !!dynamicTools,
-                playbook_loaded: !!playbook
+                playbook_loaded: !!playbook,
+                additional_tools_loaded: Array.isArray(data?.tool_metadata?.additional_tools)
+                  ? data.tool_metadata.additional_tools.length
+                  : (Array.isArray(data?.additional_tools) ? data.additional_tools.length : 0)
               }));
             }
           });
