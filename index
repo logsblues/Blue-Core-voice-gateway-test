@@ -3704,6 +3704,7 @@ class OpenAIHandler {
     if (session.callSid) session.pendingSessionUpdate = true;
 
     const sessionConfig = {
+      type: "realtime",  // v7.4.0 GA schema
       modalities: ["text", "audio"],
       voice,
       instructions: prompt,
