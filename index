@@ -80,7 +80,7 @@ import http from "http";
 // SECTION 1: CONFIGURATION & CONSTANTS
 // ============================================================
 
-const VERSION = "7.4.3";
+const VERSION = "7.4.4";
 const PORT = process.env.PORT || 10000;
 
 // Environment variables (required)
@@ -1896,7 +1896,7 @@ class CallScreeningEngine {
 
     ResponseLockManager.sendResponseCreateSafe(
       session,
-      { type: "response.create", response: { modalities: ["text", "audio"] } },
+      { type: "response.create", response: {} },
       "screening_hold"
     );
   }
@@ -1935,7 +1935,7 @@ class CallScreeningEngine {
 
     ResponseLockManager.sendResponseCreateSafe(
       session,
-      { type: "response.create", response: { modalities: ["text", "audio"] } },
+      { type: "response.create", response: {} },
       "screening_ai_resume"
     );
 
@@ -2897,7 +2897,7 @@ class ToolExecutor {
         } else {
           ResponseLockManager.sendResponseCreateSafe(
             session,
-            { type: "response.create", response: { modalities: ["text", "audio"] } },
+            { type: "response.create", response: {} },
             "tool_result_" + toolName
           );
         }
@@ -2920,7 +2920,7 @@ class ToolExecutor {
       }));
       ResponseLockManager.sendResponseCreateSafe(
         session,
-        { type: "response.create", response: { modalities: ["text", "audio"] } },
+        { type: "response.create", response: {} },
         "end_call"
       );
     }
@@ -3097,7 +3097,7 @@ class ToolExecutor {
         }));
         ResponseLockManager.sendResponseCreateSafe(
           session,
-          { type: "response.create", response: { modalities: ["text", "audio"] } },
+          { type: "response.create", response: {} },
           "transfer_announce"
         );
       }
@@ -3508,7 +3508,7 @@ class OpenAIHandler {
                   {
                     type: 'response.create',
                     response: {
-                      modalities: ['text', 'audio'],
+                      // modalities removed — v7.4.4: GA rejects unknown_parameter
                       tool_choice: enfDecision.tool_choice,
                     },
                   },
@@ -3579,7 +3579,7 @@ class OpenAIHandler {
                   }));
                   ResponseLockManager.sendResponseCreateSafe(
                     session,
-                    { type: 'response.create', response: { modalities: ['text', 'audio'] } },
+                    { type: 'response.create', response: {} },
                     'enforcement_replacement'
                   );
                 }
@@ -3602,6 +3602,17 @@ class OpenAIHandler {
           const errCode = event.error?.code || event.code;
           const errMsg  = event.error?.message || "";
           logger.error("OpenAI error", { callSid: session.callSid, error: JSON.stringify(event.error) });
+          // v7.4.4: Circuit breaker — unknown_parameter in response.* (no retry)
+          if (errCode === "unknown_parameter" && /^response\./.test(errMsg)) {
+            logger.error("[v7.4.4] response.create GA shape invalid — closing session", {
+              callSid: session.callSid, code: errCode, message: errMsg,
+            });
+            session.doNotReconnect = true;
+            try { ws.close(1011, "response_ga_shape_invalid"); } catch {}
+            const _twilioWs = session.twilioWs;
+            try { if (_twilioWs?.readyState === WebSocket.OPEN) _twilioWs.close(1011, "response_ga_shape_invalid"); } catch {}
+            break;
+          }
           // v7.4.0: Circuit breaker — stop reconnect loop on beta_api_shape_disabled
           if (errCode === "beta_api_shape_disabled" || /beta.*disabled/i.test(errMsg)) {
             logger.error("OpenAI Realtime Beta API disabled — closing without retry", {
@@ -4316,7 +4327,7 @@ OUTPUT FORMAT:
           }));
           ResponseLockManager.sendResponseCreateSafe(session, {
             type: "response.create",
-            response: { modalities: ["text", "audio"], instructions: `Say exactly: "${greeting}"` }
+            response: { instructions: `Say exactly: "${greeting}"`, audio: { format: { type: "audio/pcmu" } } }
           }, "outbound_greeting");
         }
       } else {
@@ -4325,7 +4336,7 @@ OUTPUT FORMAT:
           item: { type: "message", role: "user", content: [{ type: "input_text", text: "[CALL CONNECTED - Customer answered. Deliver your opening greeting NOW.]" }] }
         }));
         ResponseLockManager.sendResponseCreateSafe(session, {
-          type: "response.create", response: { modalities: ["text", "audio"] }
+          type: "response.create", response: {}
         }, "outbound_generic");
       }
 
@@ -4398,7 +4409,7 @@ OUTPUT FORMAT:
           }));
           ResponseLockManager.sendResponseCreateSafe(session, {
             type: "response.create",
-            response: { modalities: ["text", "audio"], instructions: `Say exactly: "${greeting}"` }
+            response: { instructions: `Say exactly: "${greeting}"`, audio: { format: { type: "audio/pcmu" } } }
           }, "inbound_greeting");
         }
       } else {
@@ -4407,7 +4418,7 @@ OUTPUT FORMAT:
           item: { type: "message", role: "user", content: [{ type: "input_text", text: "[CALL STARTED - Customer is calling in. Greet them now.]" }] }
         }));
         ResponseLockManager.sendResponseCreateSafe(session, {
-          type: "response.create", response: { modalities: ["text", "audio"] }
+          type: "response.create", response: {}
         }, "inbound_generic");
       }
     }
@@ -4461,7 +4472,7 @@ OUTPUT FORMAT:
       }));
       ResponseLockManager.sendResponseCreateSafe(session, {
         type: "response.create",
-        response: { modalities: ["text", "audio"], instructions: `Say exactly: "${greeting}"` }
+        response: { instructions: `Say exactly: "${greeting}"`, audio: { format: { type: "audio/pcmu" } } }
       }, "elevenlabs_fallback_greeting");
     }
   }
