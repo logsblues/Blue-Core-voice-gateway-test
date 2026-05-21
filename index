@@ -80,7 +80,7 @@ import http from "http";
 // SECTION 1: CONFIGURATION & CONSTANTS
 // ============================================================
 
-const VERSION = "7.3.5";
+const VERSION = "7.4.0";
 const PORT = process.env.PORT || 10000;
 
 // Environment variables (required)
@@ -3319,11 +3319,11 @@ class OpenAIHandler {
 
       const ws = await openaiCircuit.execute(async () => {
         return new Promise((resolve, reject) => {
-          const wsUrl = `wss://api.openai.com/v1/realtime?model=${model}`;
+          const wsUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
           const openaiWs = new WebSocket(wsUrl, {
             headers: {
-              "Authorization": `Bearer ${OPENAI_API_KEY}`,
-              "OpenAI-Beta": "realtime=v1"
+              "Authorization": `Bearer ${OPENAI_API_KEY}`
+              // v7.4.0 GA: OpenAI-Beta header removed (beta_api_shape_disabled)
             }
           });
 
@@ -3377,7 +3377,8 @@ class OpenAIHandler {
           TwilioHandler.tryTriggerGreetingWhenReady(session);
           break;
 
-        case "response.audio.delta":
+        case "response.output_audio.delta":
+        case "response.audio.delta": // v7.4.0: legacy alias kept for safety
           // ── v7.3.6 FIX: drop audio while screening ──
           if (session.suppressModelAudio) {
             break;
@@ -3422,7 +3423,8 @@ class OpenAIHandler {
           }
           break;
 
-        case "response.audio_transcript.done":
+        case "response.output_audio_transcript.done":
+        case "response.audio_transcript.done": // v7.4.0: legacy alias kept for safety
           if (event.transcript) {
             session.transcripts.assistant.push(event.transcript);
             // ── v7.3.6 FIX: Only count as AI turn if it produced actual speech (not just a tool call) ──
@@ -3596,9 +3598,31 @@ class OpenAIHandler {
           // ── end enforcement hook 2 ──
           await ToolExecutor.execute(session, event.name, event.call_id, Parser.safeJsonParse(event.arguments, {}));
           break;
-        case "error":
+        case "error": {
+          const errCode = event.error?.code || event.code;
+          const errMsg  = event.error?.message || "";
           logger.error("OpenAI error", { callSid: session.callSid, error: JSON.stringify(event.error) });
+          // v7.4.0: Circuit breaker — stop reconnect loop on beta_api_shape_disabled
+          if (errCode === "beta_api_shape_disabled" || /beta.*disabled/i.test(errMsg)) {
+            logger.error("OpenAI Realtime Beta API disabled — closing without retry", {
+              callSid: session.callSid, code: errCode, message: errMsg,
+            });
+            session.doNotReconnect = true;
+            try { ws.close(1000, "beta_api_shape_disabled"); } catch {}
+            const twilioWs = session.twilioWs;
+            try { if (twilioWs?.readyState === WebSocket.OPEN) twilioWs.close(1011, "openai_ga_migration_required"); } catch {}
+            // Log incident to Supabase (non-blocking)
+            void supabase.from("voice_gateway_incidents").insert({
+              call_sid: session.callSid,
+              company_id: session.companyId,
+              agent_id: session.agentId,
+              kind: "openai_beta_disabled",
+              gateway_version: VERSION,
+              details: { code: errCode, message: errMsg },
+            }).catch(() => {});
+          }
           break;
+        }
       }
     });
 
@@ -3606,7 +3630,7 @@ class OpenAIHandler {
       logger.info("OpenAI connection closed", { callSid: session.callSid || "prewarm", code });
 
       // ✅ FIX RES-1: Auto-reconnect on unexpected close (not 1000 = normal)
-      if (code !== 1000 && !session.callEnding && !session.sessionDestroyed && session.callSid) {
+      if (code !== 1000 && !session.callEnding && !session.sessionDestroyed && session.callSid && !session.doNotReconnect) {
         const MAX_RECONNECT = 3;
         session._reconnectAttempts = (session._reconnectAttempts || 0) + 1;
 
@@ -3693,7 +3717,9 @@ class OpenAIHandler {
         type: "server_vad",
         threshold: 0.5,
         prefix_padding_ms: 300,
-        silence_duration_ms: config.vadSilenceMs || 500  // ✅ FIX BUG-3: configurable, min recommended 200ms
+        silence_duration_ms: config.vadSilenceMs || 500,  // ✅ FIX BUG-3: configurable, min recommended 200ms
+        create_response: true,     // v7.4.0 GA schema
+        interrupt_response: true,  // v7.4.0 GA schema
       },
       tools,
       // NEW v7: Dynamic temperature and max_tokens
