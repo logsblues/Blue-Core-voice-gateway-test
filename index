@@ -80,7 +80,7 @@ import http from "http";
 // SECTION 1: CONFIGURATION & CONSTANTS
 // ============================================================
 
-const VERSION = "7.4.4";
+const VERSION = "7.4.5";
 const PORT = process.env.PORT || 10000;
 
 // Environment variables (required)
@@ -4327,7 +4327,7 @@ OUTPUT FORMAT:
           }));
           ResponseLockManager.sendResponseCreateSafe(session, {
             type: "response.create",
-            response: { instructions: `Say exactly: "${greeting}"`, audio: { format: { type: "audio/pcmu" } } }
+            response: { instructions: `Say exactly: "${greeting}"` }
           }, "outbound_greeting");
         }
       } else {
@@ -4409,7 +4409,7 @@ OUTPUT FORMAT:
           }));
           ResponseLockManager.sendResponseCreateSafe(session, {
             type: "response.create",
-            response: { instructions: `Say exactly: "${greeting}"`, audio: { format: { type: "audio/pcmu" } } }
+            response: { instructions: `Say exactly: "${greeting}"` }
           }, "inbound_greeting");
         }
       } else {
@@ -4472,7 +4472,7 @@ OUTPUT FORMAT:
       }));
       ResponseLockManager.sendResponseCreateSafe(session, {
         type: "response.create",
-        response: { instructions: `Say exactly: "${greeting}"`, audio: { format: { type: "audio/pcmu" } } }
+        response: { instructions: `Say exactly: "${greeting}"` }
       }, "elevenlabs_fallback_greeting");
     }
   }
