@@ -80,7 +80,7 @@ import http from "http";
 // SECTION 1: CONFIGURATION & CONSTANTS
 // ============================================================
 
-const VERSION = "7.4.0";
+const VERSION = "7.4.2";
 const PORT = process.env.PORT || 10000;
 
 // Environment variables (required)
@@ -3705,7 +3705,7 @@ class OpenAIHandler {
 
     const sessionConfig = {
       type: "realtime",  // v7.4.0 GA schema
-      modalities: ["text", "audio"],
+      // modalities removed — v7.4.2: GA rejects with unknown_parameter: 'session.modalities'
       voice,
       instructions: prompt,
       input_audio_format: "g711_ulaw",
