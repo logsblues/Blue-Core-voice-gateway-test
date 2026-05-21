@@ -80,7 +80,7 @@ import http from "http";
 // SECTION 1: CONFIGURATION & CONSTANTS
 // ============================================================
 
-const VERSION = "7.4.2";
+const VERSION = "7.4.3";
 const PORT = process.env.PORT || 10000;
 
 // Environment variables (required)
@@ -3691,41 +3691,69 @@ class OpenAIHandler {
       ? (session.dynamicInstructionsMode === "full" ? "dynamic_full" : "merged")
       : "default";
 
+    // v7.4.3: structured log showing GA nested audio schema
+    const _logPayload = {
+      type: "session.update",
+      session: {
+        type: "realtime",
+        model: config.aiModel || OPENAI_REALTIME_MODEL,
+        hasInstructions: !!prompt,
+        instructionsLen: prompt?.length ?? 0,
+        audio: {
+          input: {
+            format: { type: "audio/pcmu" },
+            hasTranscription: true,
+            turn_detection: "server_vad",
+          },
+          output: {
+            format: { type: "audio/pcmu" },
+            voice,
+          },
+        },
+        toolsCount: tools.length,
+        tool_choice: "auto",
+      },
+    };
     logger.info("Sending session.update", {
       callSid: session.callSid || "prewarm",
       promptSource, promptLength: prompt.length,
       voice, toolCount: tools.length,
       additionalToolCount: Array.isArray(session.additionalTools) ? session.additionalTools.length : 0,
       aiModel: config.aiModel,
-      temperature: config.aiTemperature,
-      sttModel: config.sttModel
+      sttModel: config.sttModel,
+      payload: _logPayload,
     });
 
     if (session.callSid) session.pendingSessionUpdate = true;
 
+    // v7.4.3: GA nested audio schema (voice/formats/transcription/turn_detection moved to session.audio)
     const sessionConfig = {
-      type: "realtime",  // v7.4.0 GA schema
-      // modalities removed — v7.4.2: GA rejects with unknown_parameter: 'session.modalities'
-      voice,
+      type: "realtime",
+      model: config.aiModel || OPENAI_REALTIME_MODEL,
       instructions: prompt,
-      input_audio_format: "g711_ulaw",
-      output_audio_format: "g711_ulaw",
-      input_audio_transcription: {
-        model: config.sttModel || "whisper-1",
-        language: config.sttLanguage || config.language || DEFAULT_LANGUAGE  // NEW v7
-      },
-      turn_detection: {
-        type: "server_vad",
-        threshold: 0.5,
-        prefix_padding_ms: 300,
-        silence_duration_ms: config.vadSilenceMs || 500,  // ✅ FIX BUG-3: configurable, min recommended 200ms
-        create_response: true,     // v7.4.0 GA schema
-        interrupt_response: true,  // v7.4.0 GA schema
+      audio: {
+        input: {
+          format: { type: "audio/pcmu" },  // g711 μ-law
+          transcription: {
+            model: config.sttModel || "whisper-1",
+          },
+          turn_detection: {
+            type: "server_vad",
+            threshold: 0.5,
+            prefix_padding_ms: 300,
+            silence_duration_ms: config.vadSilenceMs || 500,
+            create_response: true,
+            interrupt_response: true,
+          },
+        },
+        output: {
+          format: { type: "audio/pcmu" },
+          voice,  // voice now lives under session.audio.output.voice
+        },
       },
       tools,
-      // NEW v7: Dynamic temperature and max_tokens
-      temperature: Math.max(0.6, config.aiTemperature ?? 0.8), // v7.2.0: Floor to 0.6 (OpenAI Realtime minimum)
-      max_response_output_tokens: config.aiMaxTokens ?? 4096
+      tool_choice: "auto",
+      // temperature removed — v7.4.3: causes unknown_parameter in GA schema
     };
 
     session.openaiWs.send(JSON.stringify({
