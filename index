@@ -80,7 +80,7 @@ import http from "http";
 // SECTION 1: CONFIGURATION & CONSTANTS
 // ============================================================
 
-const VERSION = "7.4.5";
+const VERSION = "7.5.0";
 const PORT = process.env.PORT || 10000;
 
 // Environment variables (required)
@@ -676,8 +676,14 @@ class SessionManager {
       screeningHoldTimer: null,
       screeningPollTimer: null,
       screeningTimeoutTimer: null,
-      screeningResolved: false,     // Prevents double resolution
-
+       screeningResolved: false,     // Prevents double resolution
+      // ── v7.5.0: Active Response Manager state ──
+      activeResponseId: null,         // currently in-flight response.id
+      responseQueue: [],              // pending response.create payloads
+      cancellingResponse: false,      // true between response.cancel and confirmation
+      blockedToolsForCall: new Set(), // tool names blocked for the rest of the call (do_not_retry)
+      pendingUserMessage: null,       // assistant utterance to speak ASAP after tool result
+      lastToolStartAt: new Map(),     // toolName -> ts (anti-silence acknowledgement timer)
       // Conversational state
       transcripts: { user: [], assistant: [] },
       toolCalls: [],
@@ -856,6 +862,66 @@ class ResponseLockManager {
     }
     return false;
   }
+}
+
+// ============================================================
+// v7.5.0: ACTIVE RESPONSE MANAGER helpers
+// ============================================================
+const ACK_LINES = {
+  default_en: "Perfect, let me check that for you.",
+  default_es: "Perfecto, déjame revisarlo.",
+  saving_en:  "I'm saving that information now.",
+  saving_es:  "Estoy guardando esa información.",
+};
+
+function enqueueResponseCreate(session, payload) {
+  if (session.activeResponseId || session.cancellingResponse) {
+    session.responseQueue.push(payload);
+    logger.info('[v7.5.0] response.create queued', {
+      callSid: session.callSid,
+      queueLen: session.responseQueue.length,
+    });
+    return;
+  }
+  _sendResponseCreateDirect(session, payload);
+}
+
+function _sendResponseCreateDirect(session, payload) {
+  if (session.callEnding) return;
+  if (session.openaiWs?.readyState !== WebSocket.OPEN) return;
+  logger.info('[v7.5.0] response.create sent', { callSid: session.callSid });
+  session.openaiWs.send(JSON.stringify({ type: 'response.create', ...payload }));
+}
+
+function flushResponseQueue(session) {
+  if (session.activeResponseId || session.cancellingResponse) return;
+  const next = session.responseQueue.shift();
+  if (!next) return;
+  logger.info('[v7.5.0] queued response flushed', {
+    callSid: session.callSid,
+    remaining: session.responseQueue.length,
+  });
+  _sendResponseCreateDirect(session, next);
+}
+
+function scheduleAcknowledgement(session, toolName) {
+  session.lastToolStartAt.set(toolName, Date.now());
+  const lang = session.language === 'es' ? 'es' : 'en';
+  const isSave = /^(create_|update_|take_note|add_)/.test(toolName);
+  const line = isSave ? ACK_LINES[`saving_${lang}`] : ACK_LINES[`default_${lang}`];
+  setTimeout(() => {
+    const started = session.lastToolStartAt.get(toolName);
+    if (!started) return; // already cleared
+    if (Date.now() - started < 300) return;
+    if (session.activeResponseId || session.cancellingResponse) return;
+    enqueueResponseCreate(session, {
+      response: { instructions: `Say briefly and naturally: "${line}". Do not add anything else.` },
+    });
+  }, 300);
+}
+
+function clearAcknowledgement(session, toolName) {
+  session.lastToolStartAt.delete(toolName);
 }
 
 /**
@@ -2777,6 +2843,19 @@ class ToolExecutor {
     const startTime = Date.now();
     logger.info("Tool execution started", { callSid: session.callSid, toolName, callId });
 
+    // v7.5.0: Full-call tool block (do_not_retry)
+    if (session.blockedToolsForCall?.has(toolName)) {
+      logger.warn('[v7.5.0] tool blocked for call', { callSid: session.callSid, toolName });
+      const blockedResult = {
+        success: false,
+        error: 'tool_blocked_for_call',
+        do_not_retry: true,
+        user_message: "I already saved your information; someone from our team will follow up.",
+        message: `${toolName} is blocked for the remainder of this call. Continue naturally; do not call this tool again.`,
+      };
+      this._sendToolResult(session, callId, blockedResult, toolName);
+      return blockedResult;
+    }
     // Check deduplication
     const dedupCheck = ToolDeduplicator.shouldExecute(session, toolName, args);
     if (!dedupCheck.shouldExecute) {
@@ -2829,6 +2908,8 @@ class ToolExecutor {
         result = await this._executeLookup(session, args);
       } else {
         const phone = this.getCustomerPhone(session, args);
+        // v7.5.0: Anti-silence acknowledgement — fires at 300ms if tool still running
+        scheduleAcknowledgement(session, toolName);
         result = await CRMToolsClient.executeTool(toolName, { ...args, phone }, {
           companyId: session.companyId, agentId: session.agentId,
           callSid: session.callSid, customerPhone: phone, direction: session.direction
@@ -2858,18 +2939,25 @@ class ToolExecutor {
           logger.info('[restaurant] upsert_draft_success', { callSid: session.callSid });
         }
       }
-    } catch (error) {
+       } catch (error) {
       result = { success: false, error: error.message };
     }
-
+    // v7.5.0: clear anti-silence timer now that tool has returned
+    clearAcknowledgement(session, toolName);
+    // v7.5.0: honor do_not_retry — block this tool for the rest of the call
+    if (result?.do_not_retry === true) {
+      session.blockedToolsForCall?.add(toolName);
+      logger.warn('[v7.5.0] tool blocked by do_not_retry', { callSid: session.callSid, toolName });
+    }
+    // v7.5.0: capture user_message to speak verbatim after tool result
+    if (result?.user_message) {
+      session.pendingUserMessage = result.user_message;
+    }
     const duration = Date.now() - startTime;
     ToolDeduplicator.recordExecution(session, toolName, args, result);
-
     // NEW v7: Record to persistent tool call log
     ToolCallLogger.record(session, toolName, args, result, duration);
-
     logger.info("Tool execution completed", { callSid: session.callSid, toolName, durationMs: duration, success: result?.success !== false });
-
     this._sendToolResult(session, callId, result, toolName);
     return result;
   }
@@ -2887,22 +2975,23 @@ class ToolExecutor {
         }
       }));
 
-      // Only request a response if NOT ending the call
-      if (!session.callEnding) {
-        // ── v7.3.6 FIX: skip AI response if screening is active ──
-        if (session.screeningActive && toolName === "transfer_to_human") {
-          logger.info("[TOOL_RESULT] Skipping response.create — screening active", {
-            callSid: session.callSid
-          });
-        } else {
-          ResponseLockManager.sendResponseCreateSafe(
-            session,
-            { type: "response.create", response: {} },
-            "tool_result_" + toolName
-          );
+        // Only request a response if NOT ending the call
+        if (!session.callEnding) {
+          // ── v7.3.6 FIX: skip AI response if screening is active ──
+          if (session.screeningActive && toolName === "transfer_to_human") {
+            logger.info("[TOOL_RESULT] Skipping response.create — screening active", {
+              callSid: session.callSid
+            });
+          } else {
+            // v7.5.0: use pendingUserMessage as instructions if set (verbatim apology/message)
+            const responsePayload = session.pendingUserMessage
+              ? { response: { instructions: `Speak EXACTLY this line, then continue naturally: "${session.pendingUserMessage}"` } }
+              : { response: {} };
+            session.pendingUserMessage = null; // consume
+            enqueueResponseCreate(session, responsePayload);
+          }
+          // ── end fix ──
         }
-        // ── end fix ──
-      }
     }
   }
 
@@ -3521,8 +3610,33 @@ class OpenAIHandler {
             // ── end enforcement hook 1 ──
           }
           break;
+        case "input_audio_buffer.speech_started":
+          // v7.5.0: Barge-in — cancel active response if one is in flight
+          if (session.activeResponseId && !session.cancellingResponse) {
+            logger.info('[v7.5.0] barge-in cancel sent', {
+              callSid: session.callSid,
+              id: session.activeResponseId,
+            });
+            session.cancellingResponse = true;
+            if (session.openaiWs?.readyState === WebSocket.OPEN) {
+              session.openaiWs.send(JSON.stringify({ type: 'response.cancel' }));
+            }
+            // Safety timeout: if response.cancelled never arrives, unblock after 1s
+            setTimeout(() => {
+              if (session.cancellingResponse) {
+                logger.warn('[v7.5.0] barge-in safety timeout — forcing cancel clear', { callSid: session.callSid });
+                session.cancellingResponse = false;
+                session.activeResponseId = null;
+                flushResponseQueue(session);
+              }
+            }, 1000);
+          }
+          break;
         case "response.created":
           session._hasActiveResponse = true; // ✅ v7.3.4: track active response
+          // v7.5.0: Active Response Manager
+          session.activeResponseId = event.response?.id || 'unknown';
+          logger.info('[v7.5.0] response.created', { callSid: session.callSid, id: session.activeResponseId });
           break;
 
         case "response.done":
@@ -3587,9 +3701,27 @@ class OpenAIHandler {
             }
           }
           // ── end enforcement hook 3 ──
+          // v7.5.0: clear activeResponseId and flush queue
+          logger.info('[v7.5.0] response.done', { callSid: session.callSid, id: session.activeResponseId });
+          session.activeResponseId = null;
+          session.cancellingResponse = false;
+          flushResponseQueue(session);
           break;
         case "response.cancelled":
           session._hasActiveResponse = false; // ✅ v7.3.4: cancelled also clears active state
+          // v7.5.0: clear activeResponseId and flush queue
+          logger.info('[v7.5.0] response.cancelled', { callSid: session.callSid, id: session.activeResponseId });
+          session.activeResponseId = null;
+          session.cancellingResponse = false;
+          flushResponseQueue(session);
+          break;
+        case "response.failed":
+          // v7.5.0: treat failed same as done — clear and flush
+          logger.warn('[v7.5.0] response.failed', { callSid: session.callSid, id: session.activeResponseId, error: event.error });
+          session._hasActiveResponse = false;
+          session.activeResponseId = null;
+          session.cancellingResponse = false;
+          flushResponseQueue(session);
           break;
 
          case "response.function_call_arguments.done":
@@ -3602,6 +3734,13 @@ class OpenAIHandler {
           const errCode = event.error?.code || event.code;
           const errMsg  = event.error?.message || "";
           logger.error("OpenAI error", { callSid: session.callSid, error: JSON.stringify(event.error) });
+          // v7.5.0: benign race — drop duplicate, do NOT crash or re-queue
+          if (errCode === "conversation_already_has_active_response" || errMsg.includes("conversation_already_has_active_response")) {
+            logger.warn('[v7.5.0] conversation_already_has_active_response — dropping duplicate (benign race)', {
+              callSid: session.callSid,
+            });
+            break;
+          }
           // v7.4.4: Circuit breaker — unknown_parameter in response.* (no retry)
           if (errCode === "unknown_parameter" && /^response\./.test(errMsg)) {
             logger.error("[v7.4.4] response.create GA shape invalid — closing session", {
