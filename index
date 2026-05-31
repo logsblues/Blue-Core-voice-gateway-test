@@ -1272,6 +1272,31 @@ class SupabaseClient {
         } catch (parseErr) {
           logger.warn("Prep topic JSON parse failed", { prepId, error: parseErr.message });
         }
+        // v7.3.6: Parse enforcement out of topic JSON (cold-start DB fallback)
+        if (prep.topic) {
+          try {
+            const t = typeof prep.topic === 'string' ? JSON.parse(prep.topic) : prep.topic;
+            let topicEnf = t.enforcement
+                        || t.enforcement_config
+                        || t.session_enforcement
+                        || null;
+            if (!topicEnf && t.enforcement_b64) {
+              try {
+                topicEnf = JSON.parse(Buffer.from(t.enforcement_b64, 'base64').toString('utf8'));
+              } catch (_) {}
+            }
+            if (topicEnf) {
+              session.enforcement = session.enforcement || topicEnf;
+              logger.info('[v7.3.6] Enforcement loaded from prep.topic JSON', {
+                prepId,
+                enabled: !!topicEnf.enabled,
+                vertical: topicEnf.vertical || null,
+              });
+            }
+          } catch (e) {
+            logger.warn('[v7.3.6] prep.topic JSON parse failed', { err: e?.message });
+          }
+        }
         logger.info("Prep loaded from call_prep_sessions", { prepId, hasInstructions: !!session.dynamicInstructions, callMode: session.callMode || "ai_agent", hasVoicemailScript: !!prep.voicemail_script });
         return;
       }
@@ -4186,6 +4211,15 @@ class TwilioHandler {
       session.isDemoCall = prewarmSession.isDemoCall;
       // ✅ FIX 2 v7.2.7: Transfer voicemail config from prewarm session
       session.voicemailConfig = session.voicemailConfig || prewarmSession.voicemailConfig || null;
+      // v7.3.6: Transfer enforcement config from prewarm to live session
+      session.enforcement = session.enforcement || prewarmSession.enforcement || null;
+      logger.info('[v7.3.6] Enforcement reuse from prewarm', {
+        callSid: session.callSid,
+        hasPrewarmEnforcement: !!prewarmSession.enforcement,
+        hasSessionEnforcement: !!session.enforcement,
+        enabled: !!session.enforcement?.enabled,
+        vertical: session.enforcement?.vertical || null,
+      });
       // ✅ NEW: carry additional realtime tools forward from prewarm
       session.additionalTools = session.additionalTools || prewarmSession.additionalTools || null;
       session.language = session.language || prewarmSession.language;
@@ -4990,6 +5024,35 @@ const server = http.createServer(async (req, res) => {
             });
           }
 
+          // v7.3.6: Persist enforcement config from prewarm request (multiple aliases)
+          let _enf = data.enforcement
+                  || data.enforcement_config
+                  || data.session_enforcement
+                  || data.runtime_enforcement
+                  || (data.config && (data.config.enforcement
+                                   || data.config.session_enforcement
+                                   || data.config.runtime_enforcement))
+                  || null;
+          if (!_enf && (data.enforcement_b64 || data.enforcementB64)) {
+            try {
+              const b64 = data.enforcement_b64 || data.enforcementB64;
+              _enf = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
+            } catch (e) {
+              logger.warn('[v7.3.6] enforcement_b64 parse failed', { err: e?.message });
+            }
+          }
+          if (!_enf && data.enforcement_json) {
+            try { _enf = JSON.parse(data.enforcement_json); } catch (_) {}
+          }
+          if (_enf) {
+            session.enforcement = _enf;
+            logger.info('[v7.3.6] Enforcement loaded into prewarm session', {
+              prepId,
+              enabled: !!_enf.enabled,
+              vertical: _enf.vertical || null,
+              hasToolPolicy: !!_enf.tool_policy,
+            });
+          }
           // Connect to OpenAI for prewarm
           await OpenAIHandler.connect(session);
 
