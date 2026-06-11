@@ -5243,6 +5243,10 @@ OUTPUT FORMAT:
               logger.error("[v6.4.0] handleDetection error from safety timer", {
                 callSid: session.callSid, error: err.message
               })
+            );
+          }
+        }, 15000);
+      }
     } else {
       // ── INBOUND ───────────────────────────────────────────────────────────
       const { language: resolvedLang, source: langSource } = resolveInboundLanguage(session);
