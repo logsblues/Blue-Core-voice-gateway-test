@@ -80,7 +80,7 @@ import http from "http";
 // SECTION 1: CONFIGURATION & CONSTANTS
 // ============================================================
 
-const VERSION = "7.5.0";
+const VERSION = "12.0.0";
 const PORT = process.env.PORT || 10000;
 
 // Environment variables (required)
@@ -94,7 +94,13 @@ if (!VOICE_GATEWAY_TOKEN) {
 }
 
 // Environment variables (optional)
-const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
+// 🔒 Realtime model lock — gpt-4o-*-realtime-preview* was deprecated by OpenAI 2026-05-18.
+const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime-mini";
+const DEPRECATED_REALTIME = /^gpt-4o-.*realtime-preview/i;
+function safeRealtimeModel(m) {
+  if (!m || DEPRECATED_REALTIME.test(m)) return "gpt-realtime-mini";
+  return m;
+}
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";  // NEW v7
 const ENABLE_WEBHOOKS = process.env.ENABLE_WEBHOOKS !== "false";
 const ENABLE_METRICS = process.env.ENABLE_METRICS !== "false";
@@ -153,6 +159,50 @@ const SCREENING_POLL_INTERVAL_MS = 2000; // Poll DB for agent response
 // ── Interpreter Voice Activation (V1) ──────────────────────────────────────
 const INTERPRETER_VOICE_COMMAND_URL = SUPABASE_URL + "/functions/v1/bc-interpreter-voice-command";
 const INTERPRETER_VOICE_DEBOUNCE_MS = 5000;   // 5s debounce per agent
+
+// v12.0.0 — Phrases that prove a first_message belongs to an OUTBOUND
+// follow-up template and must NEVER be spoken on an INBOUND call.
+const OUTBOUND_GREETING_PATTERNS = [
+  /\bfollowing\s+up\b/i,
+  /\bi['’]?m\s+following\s+up\b/i,
+  /\bjust\s+following\s+up\b/i,
+  /\ble\s+llamamos\b/i,
+  /\bte\s+llamamos\b/i,
+  /\bdando\s+seguimiento\b/i,
+  /\bdar\s+seguimiento\b/i,
+  /\bhaciendo\s+seguimiento\b/i,
+  /\bseguimiento\s+(de|a|sobre)\b/i,
+];
+
+function isOutboundStyleGreeting(text) {
+  if (!text || typeof text !== "string") return false;
+  const s = text.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  return OUTBOUND_GREETING_PATTERNS.some((re) => re.test(s));
+}
+
+// v12.0.0 — Inbound language priority:
+//   1) contact.preferred_language (registered customer)
+//   2) detected language from last conversation / history
+//   3) company default language
+//   4) 'en' fallback
+function resolveInboundLanguage(session) {
+  const contactLang = session.preloadedContact?.preferred_language
+                   || session.preloadedContact?.language;
+  if (contactLang === "es" || contactLang === "en") {
+    return { language: contactLang, source: "contact.preferred_language" };
+  }
+  const histLang = session.lastConversationLanguage
+                || session.preloadedContact?.last_detected_language;
+  if (histLang === "es" || histLang === "en") {
+    return { language: histLang, source: "history" };
+  }
+  const companyLang = session.config?.companyDefaultLanguage
+                   || session.config?.language;
+  if (companyLang === "es" || companyLang === "en") {
+    return { language: companyLang, source: "company_default" };
+  }
+  return { language: "en", source: "fallback" };
+}
 const INTERPRETER_STT_CONFIDENCE_MIN = 0.85;  // min confidence for partials
 const INTERPRETER_VOICE_PHRASES = [
   /\bactiv[ae]r?\s+int[ée]rpret[ea]\b/i,
@@ -699,6 +749,9 @@ class SessionManager {
       agentTrackSid: null,             // Twilio track SID for outbound (agent) track
       customerCallSid: null,           // customer (parent) leg CallSid for POST body
       humanBridgeActive: false,        // true when human agent is bridged in
+      // v7.5.1 Interpreter Runtime Listener      interpreterRuntimeListener: null,  // InterpreterRuntimeListener instance
+      interpreterRuntimeActive: false,  // true once interpreter mode activated at runtime
+      agentCallSid: null,               // Twilio CallSid of the agent leg (PSTN or WebRTC)
       // Conversational state
       transcripts: { user: [], assistant: [] },
       toolCalls: [],
@@ -802,6 +855,8 @@ class SessionManager {
       if (session.voicemailSafetyTimer) clearTimeout(session.voicemailSafetyTimer); // ✅ v6.4.0
       // v7.5.0: Stop interpreter voice detector
       if (session.agentVoiceDetector) { session.agentVoiceDetector.stop(); session.agentVoiceDetector = null; }
+      // v7.5.1: Stop interpreter runtime listener
+      if (session.interpreterRuntimeListener) { session.interpreterRuntimeListener.stop(); session.interpreterRuntimeListener = null; }
       if (session.screeningHoldTimer) clearInterval(session.screeningHoldTimer);
       if (session.screeningPollTimer) clearInterval(session.screeningPollTimer);
       if (session.screeningTimeoutTimer) clearTimeout(session.screeningTimeoutTimer);
@@ -1172,7 +1227,7 @@ class SupabaseClient {
           config.elevenlabsStyle = bcAgent.elevenlabs_style ?? 0.0;
           config.elevenlabsSpeed = bcAgent.elevenlabs_speed ?? 1.0;
           config.elevenlabsModelId = bcAgent.elevenlabs_model_id || "eleven_turbo_v2_5";
-          config.aiModel = bcAgent.ai_model || OPENAI_REALTIME_MODEL;
+          config.aiModel = safeRealtimeModel(bcAgent.ai_model);
           config.aiTemperature = Math.max(0.6, bcAgent.ai_temperature ?? 0.8); // v7.2.0: OpenAI Realtime min is 0.6
           config.aiMaxTokens = bcAgent.ai_max_tokens ?? 4096;
           config.sttProvider = bcAgent.stt_provider || "openai";
@@ -1837,7 +1892,7 @@ class CallScreeningEngine {
 
       try {
         const res = await fetch(
-          `${SUPABASE_URL}/rest/v1/voicecore_calls?id=eq.${session.screeningCallId}&select=status,agent_responded_at`,
+          `${SUPABASE_URL}/rest/v1/voicecore_calls?id=eq.${session.screeningCallId}&select=status,agent_responded_at,agent_call_sid,pstn_call_sid`,
           {
             headers: {
               "apikey": SUPABASE_SERVICE_KEY,
@@ -1848,9 +1903,19 @@ class CallScreeningEngine {
 
         if (!res.ok) return;
         const data = await res.json();
-        const call = data?.[0];
+         const call = data?.[0];
         if (!call) return;
-
+        // v7.5.1: Capture agentCallSid from voicecore_calls poll
+        const polledAgentSid = call.agent_call_sid || call.pstn_call_sid;
+        if (polledAgentSid && !session.agentCallSid) {
+          session.agentCallSid = polledAgentSid;
+          logger.info("[interpreter-voice] agent_call_sid_captured", {
+            callSid: session.callSid,
+            agentCallSid: session.agentCallSid,
+            source: "voicecore_calls_poll",
+            ts: new Date().toISOString(),
+          });
+        }
         // Check if agent has responded
         const resolvedStatuses = ["accepted", "rejected", "message", "callback"];
         if (resolvedStatuses.includes(call.status)) {
@@ -1892,6 +1957,16 @@ class CallScreeningEngine {
 
         // ── v7.3.6 FIX: Do NOT resume AI if PSTN is now ringing the agent ──
         if (timeoutData.action === "pstn_fallback" || timeoutData.pstn_triggered) {
+          // v7.5.1: Capture agentCallSid from PSTN fallback for interpreter activation
+          if (timeoutData.pstn_call_sid) {
+            session.agentCallSid = timeoutData.pstn_call_sid;
+            logger.info("[interpreter-voice] agent_call_sid_captured", {
+              callSid: session.callSid,
+              agentCallSid: session.agentCallSid,
+              source: "screening_timeout_pstn_fallback",
+              ts: new Date().toISOString(),
+            });
+          }
           logger.info("[SCREENING] PSTN ringing agent, keeping AI silent", {
             callSid: session.callSid,
             agentPhone: timeoutData.agent_phone,
@@ -3295,6 +3370,11 @@ class ToolExecutor {
                 dialTarget,
               });
             }
+            // v7.5.1: Start runtime listener to poll for interpreter_enabled flag
+            if (!session.interpreterRuntimeListener) {
+              session.interpreterRuntimeListener = new InterpreterRuntimeListener(session);
+              session.interpreterRuntimeListener.start();
+            }
           }
 
           // 5. Update call record (non-critical)
@@ -3306,9 +3386,24 @@ class ToolExecutor {
           } catch (e) { /* non-critical */ }
 
           // 6. Close WebSockets after redirect takes effect
+          // v7.5.1 FIX: If humanBridgeActive, keep twilioWs alive so AgentVoiceCommandDetector
+          // can continue receiving audio from the agent leg. Only close openaiWs (AI no longer needed).
           setTimeout(() => {
-            if (session.openaiWs?.readyState === WebSocket.OPEN) session.openaiWs.close(1000, "transfer");
-            if (session.twilioWs?.readyState === WebSocket.OPEN) session.twilioWs.close(1000, "transfer");
+            if (session.openaiWs?.readyState === WebSocket.OPEN) {
+              session.openaiWs.close(1000, "transfer");
+              logger.info('[interpreter-voice] openai_ws_closed_post_transfer', { callSid: session.callSid });
+            }
+            if (session.humanBridgeActive) {
+              // Keep Twilio WS alive for agent voice command detection
+              logger.info('[interpreter-voice] interpreter_voice_listener_started', {
+                callSid: session.callSid,
+                companyId: session.companyId,
+                agentId: session.agentId,
+                ts: new Date().toISOString(),
+              });
+            } else {
+              if (session.twilioWs?.readyState === WebSocket.OPEN) session.twilioWs.close(1000, "transfer");
+            }
           }, 2000);
 
         } catch (transferErr) {
@@ -4005,6 +4100,251 @@ class OpenAIHandler {
 }
 
 // ============================================================
+// INTERPRETER RUNTIME LISTENER — Polling for interpreter_enabled flag
+// ============================================================
+/**
+ * Polls Supabase every 3s for interpreter_enabled=true on the active call.
+ * When detected, activates interpreter mode on the live session without
+ * requiring a hang-up or dashboard action.
+ *
+ * Triggered after humanBridgeActive=true (post-transfer).
+ */
+class InterpreterRuntimeListener {
+  constructor(session) {
+    this.session = session;
+    this._timer = null;
+    this._active = false;
+    this._pollIntervalMs = 3000;
+  }
+
+  start() {
+    if (this._active) return;
+    this._active = true;
+    logger.info('[interpreter-voice] interpreter_runtime_listener_started', {
+      callSid: this.session.callSid,
+      companyId: this.session.companyId,
+      agentId: this.session.agentId,
+      ts: new Date().toISOString(),
+    });
+    this._schedule();
+  }
+
+  stop() {
+    this._active = false;
+    if (this._timer) { clearTimeout(this._timer); this._timer = null; }
+  }
+
+  _schedule() {
+    if (!this._active) return;
+    this._timer = setTimeout(() => this._poll(), this._pollIntervalMs);
+  }
+
+  async _poll() {
+    if (!this._active) return;
+    const session = this.session;
+    try {
+      const callSid = session.callSid;
+      const prepId = session.prepId;
+      if (!callSid && !prepId) { this._schedule(); return; }
+
+      // v7.5.1 FIX: Query bc_call_prep_sessions (primary) where bc-activate-interpreter writes
+      // Falls back to call_prep_sessions if bc_ table returns no row.
+      let row = null;
+      let tableUsed = null;
+
+      if (prepId) {
+        // Primary: bc_call_prep_sessions (Blue Core)
+        const bcUrl = `${SUPABASE_URL}/rest/v1/bc_call_prep_sessions?id=eq.${encodeURIComponent(prepId)}&select=interpreter_enabled,call_mode`;
+        const bcRes = await fetch(bcUrl, {
+          headers: {
+            'apikey': process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_KEY,
+            'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY}`,
+          },
+        });
+        if (bcRes.ok) {
+          const bcRows = await bcRes.json();
+          if (bcRows?.[0]) { row = bcRows[0]; tableUsed = 'bc_call_prep_sessions'; }
+        }
+
+        // Fallback: call_prep_sessions
+        if (!row) {
+          const cpUrl = `${SUPABASE_URL}/rest/v1/call_prep_sessions?prep_id=eq.${encodeURIComponent(prepId)}&select=interpreter_enabled,call_mode`;
+          const cpRes = await fetch(cpUrl, {
+            headers: {
+              'apikey': process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_KEY,
+              'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY}`,
+            },
+          });
+          if (cpRes.ok) {
+            const cpRows = await cpRes.json();
+            if (cpRows?.[0]) { row = cpRows[0]; tableUsed = 'call_prep_sessions'; }
+          }
+        }
+      }
+
+      if (!row) {
+        logger.warn('[interpreter-voice] interpreter_flag_polled_no_row', {
+          callSid, prepId, ts: new Date().toISOString(),
+        });
+        this._schedule();
+        return;
+      }
+
+      logger.info('[interpreter-voice] interpreter_flag_polled', {
+        table: tableUsed,
+        callSid,
+        prepId,
+        interpreter_enabled: row?.interpreter_enabled,
+        call_mode: row?.call_mode,
+        ts: new Date().toISOString(),
+      });
+
+      if (row?.interpreter_enabled === true && !session.interpreterRuntimeActive) {
+        logger.info('[interpreter-voice] interpreter_activation_detected', {
+          callSid, prepId, companyId: session.companyId, agentId: session.agentId,
+          table: tableUsed,
+          ts: new Date().toISOString(),
+        });
+        this.stop(); // Stop polling once activated
+        await this._activateInterpreterMode();
+        return;
+      }
+    } catch (err) {
+      logger.warn('[interpreter-voice] interpreter_flag_poll_exception', {
+        callSid: session.callSid, err: err.message, ts: new Date().toISOString(),
+      });
+    }
+    this._schedule();
+  }
+
+  async _activateInterpreterMode() {
+    const session = this.session;
+    if (session.interpreterRuntimeActive) return; // guard double-activation
+    // NOTE: do NOT set interpreterRuntimeActive=true until BOTH legs are redirected
+
+    const prepId = session.prepId;
+    if (!prepId) {
+      logger.error('[interpreter-voice] activation_failed_no_prepId', {
+        callSid: session.callSid, ts: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // v7.5.1 BLOCKER: agentCallSid is REQUIRED — we cannot redirect the agent leg without it.
+    // If missing, abort and log activation_failed_missing_agent_call_sid.
+    const agentCallSid = session.agentCallSid || null;
+    if (!agentCallSid) {
+      logger.error('[interpreter-voice] activation_failed_missing_agent_call_sid', {
+        callSid: session.callSid,
+        prepId,
+        note: 'agentCallSid not yet captured. Will retry on next poll cycle.',
+        ts: new Date().toISOString(),
+      });
+      return; // CRITICAL: do NOT proceed without agent leg SID
+    }
+
+    logger.info('[interpreter-voice] switching_to_interpreter_mode', {
+      callSid: session.callSid,
+      prepId,
+      companyId: session.companyId,
+      agentId: session.agentId,
+      agentCallSid,
+      ts: new Date().toISOString(),
+    });
+
+    // Dual-leg redirect: reuse the existing interpreter motor.
+    // Both legs are redirected to bc-twiml-voice with interpreterLeg=customer/agent + prepId.
+    const TWIML_VOICE_URL = `${SUPABASE_URL}/functions/v1/bc-twiml-voice`;
+    const twilioSid = session.twilioOwnerSid || process.env.TWILIO_ACCOUNT_SID;
+    let twilioToken = session.twilioOwnerToken;
+    if (!twilioToken) {
+      // Use the same helper as _executeLegacyTransfer to resolve the token
+      twilioToken = await ToolExecutor._resolveTwilioTokenForOwner(session);
+      if (twilioToken) session.twilioOwnerToken = twilioToken; // cache for reuse
+    }
+
+    if (!twilioSid || !twilioToken) {
+      logger.error('[interpreter-voice] activation_failed_no_twilio_creds', {
+        callSid: session.callSid,
+        ownerSid: twilioSid ? twilioSid.substring(0, 12) + '...' : null,
+        hasToken: !!twilioToken,
+        ts: new Date().toISOString(),
+      });
+      return;
+    }
+
+    const authHeader = 'Basic ' + Buffer.from(`${twilioSid}:${twilioToken}`).toString('base64');
+    const baseApiUrl = `https://api.twilio.com/2010-04-01/Accounts/${twilioSid}/Calls`;
+
+    const customerCallSid = session.customerCallSid || session.callSid;
+    const customerTwimlUrl = `${TWIML_VOICE_URL}?prepId=${encodeURIComponent(prepId)}&interpreterLeg=customer&agentId=${encodeURIComponent(session.agentId)}&companyId=${encodeURIComponent(session.companyId)}`;
+    const agentTwimlUrl    = `${TWIML_VOICE_URL}?prepId=${encodeURIComponent(prepId)}&interpreterLeg=agent&agentId=${encodeURIComponent(session.agentId)}&companyId=${encodeURIComponent(session.companyId)}`;
+
+    logger.info('[interpreter-voice] redirecting_legs_to_interpreter', {
+      callSid: session.callSid, customerCallSid, agentCallSid, prepId,
+      customerTwimlUrl, agentTwimlUrl, ts: new Date().toISOString(),
+    });
+
+    // Redirect customer leg — use Url+Method directly (avoids &amp; escaping issues in TwiML)
+    let customerRedirectOk = false;
+    try {
+      const res = await fetch(`${baseApiUrl}/${customerCallSid}.json`, {
+        method: 'POST',
+        headers: { 'Authorization': authHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ Url: customerTwimlUrl, Method: 'POST' }).toString(),
+      });
+      customerRedirectOk = res.ok;
+      logger.info('[interpreter-voice] customer_leg_redirect', {
+        callSid: customerCallSid, status: res.status, ok: res.ok, ts: new Date().toISOString(),
+      });
+    } catch (err) {
+      logger.error('[interpreter-voice] customer_leg_redirect_error', {
+        callSid: customerCallSid, err: err.message, ts: new Date().toISOString(),
+      });
+    }
+
+    // Redirect agent leg — use Url+Method directly (avoids &amp; escaping issues in TwiML)
+    let agentRedirectOk = false;
+    try {
+      const res = await fetch(`${baseApiUrl}/${agentCallSid}.json`, {
+        method: 'POST',
+        headers: { 'Authorization': authHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ Url: agentTwimlUrl, Method: 'POST' }).toString(),
+      });
+      agentRedirectOk = res.ok;
+      logger.info('[interpreter-voice] agent_leg_redirect', {
+        callSid: agentCallSid, status: res.status, ok: res.ok, ts: new Date().toISOString(),
+      });
+    } catch (err) {
+      logger.error('[interpreter-voice] agent_leg_redirect_error', {
+        callSid: agentCallSid, err: err.message, ts: new Date().toISOString(),
+      });
+    }
+
+    // Only mark active if BOTH legs were redirected successfully
+    if (customerRedirectOk && agentRedirectOk) {
+      session.interpreterRuntimeActive = true;
+      logger.info('[interpreter-voice] interpreter_mode_active', {
+        callSid: session.callSid,
+        prepId,
+        companyId: session.companyId,
+        agentId: session.agentId,
+        customerRedirectOk,
+        agentRedirectOk,
+        note: 'both_legs_redirected',
+        ts: new Date().toISOString(),
+      });
+    } else {
+      logger.error('[interpreter-voice] activation_failed_redirect_error', {
+        callSid: session.callSid, prepId, customerRedirectOk, agentRedirectOk,
+        note: 'interpreter_mode_active NOT set — one or both legs failed to redirect',
+        ts: new Date().toISOString(),
+      });
+    }
+  }
+}
+
+// ============================================================
 // AGENT VOICE COMMAND DETECTOR — Interpreter Voice Activation V1
 // ============================================================
 /**
@@ -4057,6 +4397,15 @@ class AgentVoiceCommandDetector {
     if (!this._active) return;
     this._audioBuffer.push(payloadB64);
     this._totalFrames++;
+    // Sample log every 200 frames (~25s at 8kHz/20ms frames) to confirm audio is flowing
+    if (this._totalFrames % 200 === 1) {
+      logger.info('[interpreter-voice] agent_audio_frame_received', {
+        callSid: this.session.callSid,
+        frameCount: this._totalFrames,
+        bufferChunks: this._audioBuffer.length,
+        ts: new Date().toISOString(),
+      });
+    }
   }
 
   _scheduleFlush() {
@@ -4348,14 +4697,22 @@ class TwilioHandler {
             // v7.5.0 Interpreter Voice Activation V1:
             // Route audio by track. outbound_track = agent leg; inbound_track = customer leg.
             const mediaTrack = message.media?.track; // 'inbound_track' | 'outbound_track' | undefined
-            if (session.humanBridgeActive && session.agentVoiceDetector) {
-              if (mediaTrack === 'outbound_track' || session.agentTrackSid === message.media?.trackSid) {
-                // Agent audio → feed to voice command detector (do NOT send to OpenAI)
-                session.agentVoiceDetector.feedAudio(message.media.payload);
-                break; // skip OpenAI forwarding for agent track
-              } else if (mediaTrack === 'inbound_track') {
-                // Customer audio during bridge — discard (AI is silent during human bridge)
+            if (session.humanBridgeActive) {
+              if (session.interpreterRuntimeActive) {
+                // v7.5.1: Interpreter is now active — both legs have been redirected to the
+                // dual-leg interpreter motor via Twilio redirect. This session's twilioWs
+                // will close naturally as Twilio processes the redirect. Drop audio here.
                 break;
+              }
+              if (session.agentVoiceDetector) {
+                if (mediaTrack === 'outbound_track' || session.agentTrackSid === message.media?.trackSid) {
+                  // Agent audio → feed to voice command detector (do NOT send to OpenAI)
+                  session.agentVoiceDetector.feedAudio(message.media.payload);
+                  break; // skip OpenAI forwarding for agent track
+                } else if (mediaTrack === 'inbound_track') {
+                  // Customer audio during bridge — discard (AI is silent during human bridge)
+                  break;
+                }
               }
             }
             if (session.openaiWs?.readyState === WebSocket.OPEN) {
@@ -4886,48 +5243,70 @@ OUTPUT FORMAT:
               logger.error("[v6.4.0] handleDetection error from safety timer", {
                 callSid: session.callSid, error: err.message
               })
-            );
-          }
-        }, 15000);
-      }
     } else {
-      // Inbound
-      let greeting = session.dynamicFirstMessage || session.config?.firstMessage;
+      // ── INBOUND ───────────────────────────────────────────────────────────
+      const { language: resolvedLang, source: langSource } = resolveInboundLanguage(session);
+      session.language = resolvedLang;
 
-      if (greeting && session.preloadedContact && !safeName) {
-        const company = session.config?.companyName || "";
-        greeting = session.language === "en"
-          ? `Hello! Thank you for calling${company ? " " + company : ""}. How can I help you today?`
-          : `Ã‚Â¡Hola! Gracias por llamar${company ? " a " + company : ""}. Ã‚Â¿En quÃƒÂ© puedo ayudarle hoy?`;
+      let greeting = session.dynamicFirstMessage || session.config?.firstMessage;
+      let greetingSource = greeting
+        ? (session.dynamicFirstMessage ? "prep.first_message" : "agent_core.first_message")
+        : "generated";
+
+      // HARD GUARD: never speak an outbound follow-up greeting on inbound.
+      if (greeting && isOutboundStyleGreeting(greeting)) {
+        logger.warn("[v12.0.0] inbound blocked outbound-style greeting", {
+          callSid: session.callSid,
+          original: greeting.substring(0, 120),
+          source: greetingSource,
+        });
+        greeting = null;
+        greetingSource = "regenerated_outbound_blocked";
       }
 
-      if (greeting) {
-        logger.info("Inbound greeting", { callSid: session.callSid, greeting: greeting.substring(0, 80) });
+      const company = session.config?.companyName || "";
+      const safeName = session.preloadedContact?.first_name
+                    || session.preloadedContact?.name
+                    || null;
 
-        // NEW v7: Use ElevenLabs TTS for greeting if configured
-        if (session.config?.voiceProvider === "elevenlabs" && ELEVENLABS_API_KEY) {
-          this._sendElevenLabsGreeting(session, greeting);
+      // If no greeting, regenerate a localized neutral greeting.
+      if (!greeting) {
+        if (resolvedLang === "es") {
+          greeting = safeName
+            ? `\u00a1Hola ${safeName}! Gracias por llamar${company ? " a " + company : ""}. \u00bfEn qu\u00e9 puedo ayudarte hoy?`
+            : `\u00a1Hola! Gracias por llamar${company ? " a " + company : ""}. \u00bfEn qu\u00e9 puedo ayudarte hoy?`;
         } else {
-          session.openaiWs.send(JSON.stringify({
-            type: "conversation.item.create",
-            item: { type: "message", role: "user", content: [{ type: "input_text", text: "[CALL STARTED - Customer is calling in. Greet them immediately.]" }] }
-          }));
-          ResponseLockManager.sendResponseCreateSafe(session, {
-            type: "response.create",
-            response: { instructions: `Say exactly: "${greeting}"` }
-          }, "inbound_greeting");
+          greeting = safeName
+            ? `Hi ${safeName}! Thank you for calling${company ? " " + company : ""}. How can I help you today?`
+            : `Hello! Thank you for calling${company ? " " + company : ""}. How can I help you today?`;
         }
+        if (greetingSource === "generated") greetingSource = "regenerated_localized";
+      }
+
+      logger.info("[v12.0.0] inbound greeting selected", {
+        callSid: session.callSid,
+        resolved_customer_language: resolvedLang,
+        language_source: langSource,
+        inbound_greeting_language: resolvedLang,
+        greeting_source: greetingSource,
+        greeting_preview: greeting.substring(0, 100),
+      });
+
+      if (session.config?.voiceProvider === "elevenlabs" && ELEVENLABS_API_KEY) {
+        this._sendElevenLabsGreeting(session, greeting);
       } else {
         session.openaiWs.send(JSON.stringify({
           type: "conversation.item.create",
-          item: { type: "message", role: "user", content: [{ type: "input_text", text: "[CALL STARTED - Customer is calling in. Greet them now.]" }] }
+          item: { type: "message", role: "user",
+            content: [{ type: "input_text",
+              text: `[CALL STARTED - Customer is calling in. Speak in ${resolvedLang === "es" ? "Spanish" : "English"}. Greet them immediately.]` }] }
         }));
         ResponseLockManager.sendResponseCreateSafe(session, {
-          type: "response.create", response: {}
-        }, "inbound_generic");
+          type: "response.create",
+          response: { instructions: `Say exactly: "${greeting}"` }
+        }, "inbound_greeting");
       }
-    }
-  }
+    }}
 
   /**
    * NEW v7: Send greeting via ElevenLabs TTS instead of OpenAI
