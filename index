@@ -150,6 +150,16 @@ const SCREENING_BRIDGE_URL = SUPABASE_URL + "/functions/v1/call-screening-bridge
 const HOLD_MESSAGE_INTERVAL_MS = 5000; // 5 seconds between hold messages
 const SCREENING_POLL_INTERVAL_MS = 2000; // Poll DB for agent response
 
+// ── Interpreter Voice Activation (V1) ──────────────────────────────────────
+const INTERPRETER_VOICE_COMMAND_URL = SUPABASE_URL + "/functions/v1/bc-interpreter-voice-command";
+const INTERPRETER_VOICE_DEBOUNCE_MS = 5000;   // 5s debounce per agent
+const INTERPRETER_STT_CONFIDENCE_MIN = 0.85;  // min confidence for partials
+const INTERPRETER_VOICE_PHRASES = [
+  /\bactiv[ae]r?\s+int[ée]rpret[ea]\b/i,
+  /\binterpreter\s+on\b/i,
+  /\bturn\s+on\s+(?:the\s+)?interpreter\b/i,
+];
+
 // Session pools
 const sessions = new Map();
 const prewarmSessions = new Map();
@@ -684,6 +694,11 @@ class SessionManager {
       blockedToolsForCall: new Set(), // tool names blocked for the rest of the call (do_not_retry)
       pendingUserMessage: null,       // assistant utterance to speak ASAP after tool result
       lastToolStartAt: new Map(),     // toolName -> ts (anti-silence acknowledgement timer)
+      // v7.5.0 Interpreter Voice Activation V1
+      agentVoiceDetector: null,        // AgentVoiceCommandDetector instance
+      agentTrackSid: null,             // Twilio track SID for outbound (agent) track
+      customerCallSid: null,           // customer (parent) leg CallSid for POST body
+      humanBridgeActive: false,        // true when human agent is bridged in
       // Conversational state
       transcripts: { user: [], assistant: [] },
       toolCalls: [],
@@ -785,6 +800,8 @@ class SessionManager {
       if (session.greetingTimer) clearTimeout(session.greetingTimer);
       if (session.ringbackInterval) clearInterval(session.ringbackInterval);
       if (session.voicemailSafetyTimer) clearTimeout(session.voicemailSafetyTimer); // ✅ v6.4.0
+      // v7.5.0: Stop interpreter voice detector
+      if (session.agentVoiceDetector) { session.agentVoiceDetector.stop(); session.agentVoiceDetector = null; }
       if (session.screeningHoldTimer) clearInterval(session.screeningHoldTimer);
       if (session.screeningPollTimer) clearInterval(session.screeningPollTimer);
       if (session.screeningTimeoutTimer) clearTimeout(session.screeningTimeoutTimer);
@@ -3265,6 +3282,19 @@ class ToolExecutor {
             releaseAgentOnCallEnd(session).catch(() => {});
           } else {
             logger.info("Twilio transfer redirect SUCCESS", { callSid: session.callSid, dialTarget, agentName });
+            // v7.5.0: Activate interpreter voice command detection on agent leg
+            session.humanBridgeActive = true;
+            session.customerCallSid = session.callSid; // customer is the parent leg
+            if (!session.agentVoiceDetector) {
+              session.agentVoiceDetector = new AgentVoiceCommandDetector(session);
+              session.agentVoiceDetector.start();
+              logger.info('[interpreter-voice] detector_started_on_transfer', {
+                callSid: session.callSid,
+                companyId: session.companyId,
+                agentId: session.agentId,
+                dialTarget,
+              });
+            }
           }
 
           // 5. Update call record (non-critical)
@@ -3974,6 +4004,294 @@ class OpenAIHandler {
   }
 }
 
+// ============================================================
+// AGENT VOICE COMMAND DETECTOR — Interpreter Voice Activation V1
+// ============================================================
+/**
+ * Detects interpreter activation phrases spoken by the human agent
+ * during a human↔customer bridge. Uses OpenAI Whisper STT on the
+ * outbound (agent) audio track, then POSTs to bc-interpreter-voice-command.
+ *
+ * Spec: Render Gateway – Interpreter Voice Activation Contract V1
+ */
+class AgentVoiceCommandDetector {
+  constructor(session) {
+    this.session = session;
+    this._audioBuffer = [];          // raw ulaw chunks
+    this._lastCommandAt = 0;         // debounce timestamp
+    this._active = false;
+    this._vadSilenceFrames = 0;
+    this._totalFrames = 0;
+    this._sttPending = false;
+    this._sttTimer = null;
+    this._flushIntervalMs = 1500;    // flush STT every 1.5s of agent audio
+    this._flushTimer = null;
+    this._loggedStart = false;
+  }
+
+  /** Start listening on agent audio track */
+  start() {
+    if (this._active) return;
+    this._active = true;
+    this._scheduleFlush();
+    if (!this._loggedStart) {
+      this._loggedStart = true;
+      logger.info('[interpreter-voice] agent_audio_stream_started', {
+        callSid: this.session.callSid,
+        companyId: this.session.companyId,
+        agentId: this.session.agentId,
+        ts: new Date().toISOString(),
+      });
+    }
+  }
+
+  /** Stop and clean up */
+  stop() {
+    this._active = false;
+    if (this._flushTimer) { clearTimeout(this._flushTimer); this._flushTimer = null; }
+    this._audioBuffer = [];
+  }
+
+  /** Feed a raw ulaw payload (base64 string from Twilio media event) */
+  feedAudio(payloadB64) {
+    if (!this._active) return;
+    this._audioBuffer.push(payloadB64);
+    this._totalFrames++;
+  }
+
+  _scheduleFlush() {
+    if (!this._active) return;
+    this._flushTimer = setTimeout(() => {
+      this._flush().catch(() => {});
+      this._scheduleFlush();
+    }, this._flushIntervalMs);
+  }
+
+  async _flush() {
+    if (!this._active || this._sttPending) return;
+    if (this._audioBuffer.length < 10) return; // too little audio
+    const chunks = this._audioBuffer.splice(0);
+    this._sttPending = true;
+    try {
+      await this._runStt(chunks);
+    } finally {
+      this._sttPending = false;
+    }
+  }
+
+  async _runStt(chunks) {
+    // Combine base64 ulaw chunks into a WAV buffer for Whisper
+    // ulaw 8kHz mono → convert to PCM16 WAV
+    const ulawBuf = Buffer.concat(chunks.map(c => Buffer.from(c, 'base64')));
+    if (ulawBuf.length < 800) return; // < 100ms of audio, skip
+
+    // Convert ulaw to PCM16 inline
+    const pcm = this._ulawToPcm16(ulawBuf);
+    const wavBuf = this._buildWav(pcm, 8000, 1);
+
+    // Call OpenAI Whisper via REST (not Realtime)
+    const openaiKey = process.env.OPENAI_API_KEY;
+    if (!openaiKey) return;
+
+    try {
+      const formData = new FormData();
+      const blob = new Blob([wavBuf], { type: 'audio/wav' });
+      formData.append('file', blob, 'agent_audio.wav');
+      formData.append('model', 'whisper-1');
+      formData.append('language', 'es');  // primary; Whisper auto-detects en too
+      formData.append('response_format', 'verbose_json');
+      formData.append('temperature', '0');
+
+      const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${openaiKey}` },
+        body: formData,
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      const transcript = (data.text || '').trim();
+      const confidence = data.segments?.[0]?.avg_logprob
+        ? Math.exp(data.segments[0].avg_logprob)  // logprob → probability
+        : 1.0;
+
+      if (!transcript) return;
+
+      // Sample log (not every partial)
+      if (Math.random() < 0.15) {
+        logger.info('[interpreter-voice] agent_stt_partial', {
+          callSid: this.session.callSid,
+          transcript: transcript.substring(0, 80),
+          confidence: confidence.toFixed(3),
+          ts: new Date().toISOString(),
+        });
+      }
+
+      await this._checkPhrase(transcript, confidence);
+    } catch (err) {
+      logger.warn('[interpreter-voice] stt_error', { callSid: this.session.callSid, err: err.message });
+    }
+  }
+
+  async _checkPhrase(transcript, confidence) {
+    // Normalize: strip diacritics
+    const normalized = transcript.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+    const matched = INTERPRETER_VOICE_PHRASES.some(re => re.test(normalized));
+    if (!matched) return;
+
+    // Confidence gate for partials
+    if (confidence < INTERPRETER_STT_CONFIDENCE_MIN) {
+      logger.info('[interpreter-voice] low_confidence_skip', {
+        callSid: this.session.callSid, transcript, confidence
+      });
+      return;
+    }
+
+    // Debounce
+    const now = Date.now();
+    if (now - this._lastCommandAt < INTERPRETER_VOICE_DEBOUNCE_MS) {
+      logger.info('[interpreter-voice] debounced', { callSid: this.session.callSid, transcript });
+      return;
+    }
+    this._lastCommandAt = now;
+
+    logger.info('[interpreter-voice] voice_command_candidate_detected', {
+      callSid: this.session.callSid,
+      companyId: this.session.companyId,
+      agentId: this.session.agentId,
+      transcript,
+      confidence: confidence.toFixed(3),
+      ts: new Date().toISOString(),
+    });
+
+    await this._postToEdge(transcript, confidence);
+  }
+
+  async _postToEdge(transcript, confidence) {
+    const session = this.session;
+    // Resolve customer (parent) callSid
+    const customerCallSid = session.customerCallSid || session.callSid;
+
+    const body = {
+      call_sid: customerCallSid,
+      company_id: session.companyId,
+      agent_id: session.agentId,
+      leg: 'agent',
+      transcript,
+      confidence: parseFloat(confidence.toFixed(4)),
+      source: 'render_gateway_stt',
+    };
+
+    logger.info('[interpreter-voice] voice_command_post_sent', {
+      callSid: customerCallSid,
+      companyId: session.companyId,
+      agentId: session.agentId,
+      ts: new Date().toISOString(),
+    });
+
+    const attempt = async () => fetch(INTERPRETER_VOICE_COMMAND_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY}`,
+      },
+      body: JSON.stringify(body),
+    });
+
+    let res;
+    try {
+      res = await attempt();
+      if (!res.ok) throw new Error(`http_${res.status}`);
+    } catch (err) {
+      // Retry once with 500ms backoff
+      await new Promise(r => setTimeout(r, 500));
+      try {
+        res = await attempt();
+      } catch (err2) {
+        logger.error('[interpreter-voice] voice_command_post_failed', {
+          callSid: customerCallSid, companyId: session.companyId, agentId: session.agentId,
+          http_status: 0, body: err2.message, ts: new Date().toISOString(),
+        });
+        return;
+      }
+    }
+
+    let respData = {};
+    try { respData = await res.json(); } catch (_) {}
+
+    if (!res.ok) {
+      logger.error('[interpreter-voice] voice_command_post_failed', {
+        callSid: customerCallSid, companyId: session.companyId, agentId: session.agentId,
+        http_status: res.status, body: JSON.stringify(respData), ts: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Handle response per spec §3.6
+    if (respData.activation?.already_active) {
+      logger.info('[interpreter-voice] interpreter_already_active_ack', {
+        callSid: customerCallSid, companyId: session.companyId, agentId: session.agentId,
+        ts: new Date().toISOString(),
+      });
+      return;
+    }
+    if (respData.ignored && respData.reason === 'not_agent_leg') {
+      // Critical routing error — gateway sent wrong leg
+      logger.error('[interpreter-voice] customer_leg_command_ignored_by_edge', {
+        callSid: customerCallSid, companyId: session.companyId, agentId: session.agentId,
+        ts: new Date().toISOString(),
+      });
+      return;
+    }
+    if (respData.matched && respData.forwarded) {
+      logger.info('[interpreter-voice] voice_command_post_success', {
+        callSid: customerCallSid, companyId: session.companyId, agentId: session.agentId,
+        activation: respData.activation,
+        ts: new Date().toISOString(),
+      });
+    }
+  }
+
+  // ── Audio conversion helpers ───────────────────────────────────────────
+
+  /** Convert 8-bit ulaw to signed 16-bit PCM */
+  _ulawToPcm16(ulawBuf) {
+    const ULAW_BIAS = 33;
+    const pcm = Buffer.alloc(ulawBuf.length * 2);
+    for (let i = 0; i < ulawBuf.length; i++) {
+      let u = ~ulawBuf[i] & 0xff;
+      const sign = u & 0x80;
+      const exp  = (u >> 4) & 0x07;
+      const mant = u & 0x0f;
+      let sample = ((mant << 3) + ULAW_BIAS) << exp;
+      sample -= ULAW_BIAS;
+      if (sign) sample = -sample;
+      pcm.writeInt16LE(Math.max(-32768, Math.min(32767, sample)), i * 2);
+    }
+    return pcm;
+  }
+
+  /** Build a minimal WAV header around PCM16 data */
+  _buildWav(pcmBuf, sampleRate, channels) {
+    const byteRate = sampleRate * channels * 2;
+    const blockAlign = channels * 2;
+    const header = Buffer.alloc(44);
+    header.write('RIFF', 0);
+    header.writeUInt32LE(36 + pcmBuf.length, 4);
+    header.write('WAVE', 8);
+    header.write('fmt ', 12);
+    header.writeUInt32LE(16, 16);           // PCM chunk size
+    header.writeUInt16LE(1, 20);            // PCM format
+    header.writeUInt16LE(channels, 22);
+    header.writeUInt32LE(sampleRate, 24);
+    header.writeUInt32LE(byteRate, 28);
+    header.writeUInt16LE(blockAlign, 32);
+    header.writeUInt16LE(16, 34);           // bits per sample
+    header.write('data', 36);
+    header.writeUInt32LE(pcmBuf.length, 40);
+    return Buffer.concat([header, pcmBuf]);
+  }
+}
+
 /**
  * TwilioHandler - Handle Twilio Media Streams with full param support
  * ENHANCED v7: Loads dynamic tools and playbook on call start
@@ -4021,11 +4339,24 @@ class TwilioHandler {
             await this._handleStart(session, message, urlParams);
             break;
 
-          case "media":
+          case "media": {
             if (!session.twilioStreamReady) {
               session.twilioStreamReady = true;
-              logger.debug("First media received Ã¢â‚¬â€ twilioStreamReady", { callSid: session.callSid });
+              logger.debug("First media received — twilioStreamReady", { callSid: session.callSid });
               this.tryTriggerGreetingWhenReady(session);
+            }
+            // v7.5.0 Interpreter Voice Activation V1:
+            // Route audio by track. outbound_track = agent leg; inbound_track = customer leg.
+            const mediaTrack = message.media?.track; // 'inbound_track' | 'outbound_track' | undefined
+            if (session.humanBridgeActive && session.agentVoiceDetector) {
+              if (mediaTrack === 'outbound_track' || session.agentTrackSid === message.media?.trackSid) {
+                // Agent audio → feed to voice command detector (do NOT send to OpenAI)
+                session.agentVoiceDetector.feedAudio(message.media.payload);
+                break; // skip OpenAI forwarding for agent track
+              } else if (mediaTrack === 'inbound_track') {
+                // Customer audio during bridge — discard (AI is silent during human bridge)
+                break;
+              }
             }
             if (session.openaiWs?.readyState === WebSocket.OPEN) {
               session.openaiWs.send(JSON.stringify({
@@ -4034,6 +4365,7 @@ class TwilioHandler {
               }));
             }
             break;
+          }
 
           case "stop":
             await this._handleStop(session);
