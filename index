@@ -3216,54 +3216,12 @@ class ToolExecutor {
     }
     session.transferInProgress = true;
 
-    // ── v7.3.6 FIX: suppress AI audio IMMEDIATELY before screening ──
+    // ── v7.3.6 FIX: suppress AI audio IMMEDIATELY before transfer ──
     session.suppressModelAudio = true;
-    // DO NOT set screeningActive here — initiateScreening() sets it internally after its own guard check
     try {
       session.openaiWs?.send(JSON.stringify({ type: "response.cancel" }));
-      logger.info("[TRANSFER] Cancelled active AI response before screening", { callSid: session.callSid });
+      logger.info("[TRANSFER] Cancelled active AI response before transfer", { callSid: session.callSid });
     } catch (_) {}
-    // ── end fix ──
-
-    try {
-      // ==================== NEW: Use Call Screening Engine ====================
-      const result = await CallScreeningEngine.initiateScreening(session, {
-        customer_name: session.preloadedContact?.safeName || args?.customer_name || "",
-        customer_company: args?.customer_company || "",
-        reason_summary: args?.reason || args?.reason_summary || "",
-      });
-
-      if (!result.success) {
-        // Fallback to legacy transfer if screening fails
-        logger.warn("[TRANSFER] Screening failed, falling back to legacy", {
-          callSid: session.callSid,
-          error: result.error,
-        });
-        session.transferInProgress = false;
-        return await this._executeLegacyTransfer(session, args);
-      }
-
-      return {
-        success: true,
-        action: result.action,
-        voicecore_call_id: result.voicecore_call_id,
-        message: "Call screening initiated. The system is checking agent availability.",
-      };
-
-    } catch (error) {
-      session.transferInProgress = false;
-      logger.error("[TRANSFER] Screening exception, falling back", { error: error.message });
-      return await this._executeLegacyTransfer(session, args);
-    }
-  }
-
-  static async _executeLegacyTransfer(session, args) {
-    // FIX #8: Prevent double execution
-    if (session.transferInProgress) {
-      logger.warn("Transfer already in progress, ignoring duplicate call", { callSid: session.callSid });
-      return { success: false, error: "Transfer already in progress" };
-    }
-    session.transferInProgress = true;
 
     try {
       // 1. Resolve target via agent-router edge function (availability-aware)
@@ -3275,23 +3233,18 @@ class ToolExecutor {
       }
 
       const { dialTarget, agentName, agentId, lockId } = target;
-      // Store lockId so releaseAgentOnCallEnd can release it
       session.transferLockId = lockId;
       session.transferAgentId = agentId;
 
-      // 2. Resolve Twilio credentials using OWNER SID (not env vars)
-      const twilioSid = session.twilioOwnerSid || process.env.TWILIO_ACCOUNT_SID;
-      let twilioToken = session.twilioOwnerToken;
-      if (!twilioToken) {
-        twilioToken = await this._resolveTwilioTokenForOwner(session);
-      }
-      if (!twilioSid || !twilioToken) {
-        session.transferInProgress = false;
-        return { success: false, error: "Twilio credentials not available for transfer (owner: " + (twilioSid?.substring(0, 12) || "none") + ")" };
-      }
+      logger.info("[transfer_to_human] resolved human target", {
+        callSid: session.callSid,
+        dialTarget,
+        humanAgentName: agentName,
+        humanAgentId: agentId,
+        sourceAiAgentId: session.agentId
+      });
 
-      // 3. Tell the AI to announce the transfer
-      //    FIX #9: Use role:"user" (OpenAI Realtime only accepts "user"/"assistant")
+      // 2. Tell the AI to announce the transfer
       if (session.openaiWs?.readyState === WebSocket.OPEN) {
         session.openaiWs.send(JSON.stringify({
           type: "conversation.item.create",
@@ -3308,55 +3261,50 @@ class ToolExecutor {
         );
       }
 
-      // FIX #1: Do NOT set callEnding here — it blocks _sendToolResult.
-      // It will be set inside the setTimeout AFTER the tool result has been sent.
-
-      // 4. Execute Twilio redirect after delay for AI announcement
+      // 3. Execute bc-transfer-call v3.0 after delay for AI announcement
       session.transferTimeout = setTimeout(async () => {
-        // FIX #3: Verify session is still valid before executing
         if (!session.callSid || session.sessionDestroyed) {
           logger.warn("Session already destroyed before transfer redirect", { callSid: session.callSid || "unknown" });
           return;
         }
 
-        // NOW set callEnding (FIX #1: after tool result was already sent)
         session.callEnding = true;
 
         try {
-          const twiml = `<Response><Say voice="Polly.Lupe-Neural" language="es-US">Transfiriendo su llamada a ${agentName}. Por favor espere.</Say><Dial timeout="30"><Number>${dialTarget}</Number></Dial><Say voice="Polly.Lupe-Neural" language="es-US">No pudimos completar la transferencia. Intente mas tarde.</Say><Hangup/></Response>`;
-
-          const twilioUrl = `https://api.twilio.com/2010-04-01/Accounts/${twilioSid}/Calls/${session.callSid}.json`;
-          const authHeader = "Basic " + Buffer.from(`${twilioSid}:${twilioToken}`).toString("base64");
-
-          logger.info("Executing Twilio transfer redirect", {
+          logger.info("[transfer_to_human] invoking bc-transfer-call v3.0", {
             callSid: session.callSid,
-            dialTarget,
-            agentName,
-            ownerSid: twilioSid.substring(0, 12) + "...",
-            lockId
+            dial_target: dialTarget,
+            company_id: session.companyId,
+            agent_id: agentId,
+            source_ai_agent_id: session.agentId
           });
 
-          const twilioRes = await fetch(twilioUrl, {
+          const transferRes = await fetch(`${SUPABASE_URL}/functions/v1/bc-transfer-call`, {
             method: "POST",
             headers: {
-              "Authorization": authHeader,
-              "Content-Type": "application/x-www-form-urlencoded"
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`
             },
-            body: new URLSearchParams({ Twiml: twiml }).toString()
+            body: JSON.stringify({
+              callSid: session.callSid,
+              dial_target: dialTarget,
+              company_id: session.companyId,
+              agent_id: agentId,
+              source_ai_agent_id: session.agentId
+            })
           });
 
-          if (!twilioRes.ok) {
-            const errText = await twilioRes.text();
-            logger.error("Twilio transfer redirect FAILED", {
+          if (!transferRes.ok) {
+            const errText = await transferRes.text();
+            logger.error("[transfer_to_human] bc-transfer-call failed", {
               callSid: session.callSid,
-              status: twilioRes.status,
-              error: errText,
-              usedSid: twilioSid.substring(0, 12) + "..."
+              status: transferRes.status,
+              error: errText
             });
-            // Release lock on failure so agent becomes available again
             releaseAgentOnCallEnd(session).catch(() => {});
           } else {
-            logger.info("Twilio transfer redirect SUCCESS", { callSid: session.callSid, dialTarget, agentName });
+            logger.info("[transfer_to_human] bc-transfer-call success", { callSid: session.callSid });
+            
             // v7.5.0: Activate interpreter voice command detection on agent leg
             session.humanBridgeActive = true;
             session.customerCallSid = session.callSid; // customer is the parent leg
@@ -3377,7 +3325,7 @@ class ToolExecutor {
             }
           }
 
-          // 5. Update call record (non-critical)
+          // 4. Update call record (non-critical)
           try {
             await SupabaseClient.request("calls?call_sid=eq." + session.callSid, "PATCH", {
               transferred_to_agent_id: agentId,
@@ -3385,9 +3333,10 @@ class ToolExecutor {
             });
           } catch (e) { /* non-critical */ }
 
-          // 6. Close WebSockets after redirect takes effect
+          // 5. Close WebSockets after redirect takes effect
           // v7.5.1 FIX: If humanBridgeActive, keep twilioWs alive so AgentVoiceCommandDetector
           // can continue receiving audio from the agent leg. Only close openaiWs (AI no longer needed).
+          // Phase A requirement: Do not close session.twilioWs manually after transfer.
           setTimeout(() => {
             if (session.openaiWs?.readyState === WebSocket.OPEN) {
               session.openaiWs.close(1000, "transfer");
@@ -3401,16 +3350,14 @@ class ToolExecutor {
                 agentId: session.agentId,
                 ts: new Date().toISOString(),
               });
-            } else {
-              if (session.twilioWs?.readyState === WebSocket.OPEN) session.twilioWs.close(1000, "transfer");
             }
           }, 2000);
 
         } catch (transferErr) {
-          logger.error("Transfer execution error", { callSid: session.callSid, error: transferErr.message });
+          logger.error("[transfer_to_human] bc-transfer-call exception", { callSid: session.callSid, error: transferErr.message });
           releaseAgentOnCallEnd(session).catch(() => {});
         }
-      }, 2500); // Wait 2.5s for AI announcement before Twilio redirect
+      }, 2500); // Wait 2.5s for AI announcement before transfer
 
       return { success: true, transfer_to: dialTarget, agent_name: agentName, action: "transfer" };
 
@@ -4258,7 +4205,7 @@ class InterpreterRuntimeListener {
     const twilioSid = session.twilioOwnerSid || process.env.TWILIO_ACCOUNT_SID;
     let twilioToken = session.twilioOwnerToken;
     if (!twilioToken) {
-      // Use the same helper as _executeLegacyTransfer to resolve the token
+      // Use the same helper as _executeTransfer to resolve the token
       twilioToken = await ToolExecutor._resolveTwilioTokenForOwner(session);
       if (twilioToken) session.twilioOwnerToken = twilioToken; // cache for reuse
     }
