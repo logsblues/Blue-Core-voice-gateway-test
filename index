@@ -816,6 +816,12 @@ class SessionManager {
         t_call_ended: null
       },
 
+      // A.17: Customer language detection
+      customerLang: null,          // detected from first STT turn
+      languageSource: 'unknown',   // 'stt' | 'contact' | 'agent_default'
+      customerLangLocked: false,   // true after first STT detection
+      activeLang: 'en',            // current active language for session.update
+
       // Metadata
       createdAt: Date.now(),
       updatedAt: Date.now()
@@ -1454,6 +1460,12 @@ class SupabaseClient {
         if (prep.interpreter_mode) session.interpreterMode = prep.interpreter_mode;
         if (prep.agent_language) session.agentLanguage = prep.agent_language;
         if (prep.customer_language) session.customerLanguage = prep.customer_language;
+        // A.17: Seed activeLang from prep customer_language if available
+        if (prep.customer_language) {
+          session.activeLang = prep.customer_language;
+          session.customerLang = prep.customer_language;
+          session.languageSource = 'contact';
+        }
         if (prep.tts_voice_agent) session.ttsVoiceAgent = prep.tts_voice_agent;
         if (prep.tts_voice_customer) session.ttsVoiceCustomer = prep.tts_voice_customer;
         if (prep.glossary_json) session.glossaryJson = prep.glossary_json;
@@ -2466,6 +2478,38 @@ class LanguageDetector {
 
 
 // ============================================================
+// A.17: Customer language auto-detection helpers
+// ============================================================
+function detectLang(text, fallback) {
+  const t = text.toLowerCase();
+  const esHits = (t.match(/\b(hola|buenas|gracias|por favor|necesito|quiero|estoy|se\u00f1or|se\u00f1ora|c\u00f3mo|qu\u00e9|s\u00ed|est\u00e1|usted|tambi\u00e9n|llamando|informaci\u00f3n|disponible|tardes|d\u00edas|noches)\b/g) || []).length;
+  const esChars = (t.match(/[\u00f1\u00e1\u00e9\u00ed\u00f3\u00fa\u00fc\u00bf\u00a1]/g) || []).length;
+  const enHits = (t.match(/\b(hello|hi|thanks|please|need|want|good|morning|afternoon|how|what|yes|available|calling|information)\b/g) || []).length;
+  if (esHits + esChars > enHits) return 'es';
+  if (enHits > 0) return 'en';
+  return fallback || 'en';
+}
+
+async function applyLanguageSwitch(session, toLang) {
+  const fromLang = session.activeLang;
+  session.activeLang = toLang;
+  session.language = toLang;
+  session.customerLang = toLang;
+  // Reset sessionUpdated so sendSessionUpdate sends a fresh update
+  session.sessionUpdated = false;
+  session._sessionUpdateSent = false;
+  if (session.sessionReady && session.openaiWs?.readyState === WebSocket.OPEN && session.config) {
+    OpenAIHandler.sendSessionUpdate(session);
+    logger.info('[lang_switch] applied', {
+      callSid: session.callSid,
+      fromLang,
+      toLang,
+      promptLength: PromptBuilder.build(session, session.config).length,
+    });
+  }
+}
+
+// ============================================================
 // VOICEMAIL INJECTION HELPER — v7.3.4
 // Wait-for-idle approach: defers injection until OpenAI response is done
 // Eliminates "conversation_already_has_active_response" errors
@@ -2815,6 +2859,28 @@ class PromptBuilder {
       parts.push("\nHuman agents: " + config.humanAgents.map(a => a.name).join(", "));
     }
 
+    // A.16: Message-for-agent directive (inbound normal — not recovery, recovery has its own prompt)
+    if (!isOutbound && !session.isRecovery) {
+      const msgLang = (session.language || config.language || DEFAULT_LANGUAGE);
+      if (msgLang === 'es') {
+        parts.push("\n## DEJAR MENSAJE PARA EL AGENTE");
+        parts.push("Si el cliente dice \"d\u00e9jale un mensaje a [nombre]\", \"solo quiero dejar un mensaje\" o similar:");
+        parts.push("1. Di: \"Puedo tomarle un mensaje. Por favor d\u00edgame su nombre, el mejor n\u00famero para devolverle la llamada y el motivo.\"");
+        parts.push("2. Repite el n\u00famero d\u00edgito por d\u00edgito y confirma.");
+        parts.push("3. Confirma: \"Perfecto, le env\u00edo este mensaje al agente ahora mismo.\"");
+        parts.push("4. Llama take_note con note_type=\"message_for_agent\" y el mensaje completo.");
+        parts.push("5. Desp\u00eddate y llama end_call.");
+      } else {
+        parts.push("\n## LEAVE A MESSAGE FOR THE AGENT");
+        parts.push("If the caller says \"tell [name] to call me back\", \"leave a message\" or similar:");
+        parts.push("1. Say: \"I can take a message. Please give me your name, the best callback number, and the reason for your call.\"");
+        parts.push("2. Repeat the number digit by digit and confirm.");
+        parts.push("3. Confirm: \"Perfect, I'm sending this message to the agent right now.\"");
+        parts.push("4. Call take_note with note_type=\"message_for_agent\" and the full message.");
+        parts.push("5. Say goodbye and call end_call.");
+      }
+    }
+
     // ✅ FIX DT-3: Current date/time so agent can schedule appointments correctly
     const _tz = config.companyTimezone || DEFAULT_TIMEZONE;
     const _now = new Date().toLocaleString("es-US", {
@@ -3126,6 +3192,11 @@ class ToolExecutor {
 
     let result;
 
+    // A.16: Enrich take_note args with session fields before dispatch
+    if (toolName === 'take_note') {
+      args = ToolExecutor._injectMessageForAgentDefaults(toolName, args, session);
+    }
+
     try {
       // ── CAMBIO 3: Block end_call if restaurant order was not created ──
       if (toolName === 'end_call' && session.restaurantOrderFailed) {
@@ -3220,6 +3291,32 @@ class ToolExecutor {
     logger.info("Tool execution completed", { callSid: session.callSid, toolName, durationMs: duration, success: result?.success !== false });
     this._sendToolResult(session, callId, result, toolName);
     return result;
+  }
+
+  // A.16: Inject caller_phone, for_human_agent_id, and note_type into take_note args
+  static _injectMessageForAgentDefaults(toolName, args, session) {
+    if (toolName !== 'take_note') return args;
+    const isMessage = args.note_type === 'message_for_agent';
+    const looksLikeMessage = /mensaje|leave a message|tell .* to call|d\u00e9jale/i.test(
+      args.note || args.content || args.message || ''
+    );
+    const finalIsMessage = isMessage || looksLikeMessage || !!session.isRecovery;
+    const enriched = {
+      ...args,
+      note_type: finalIsMessage ? 'message_for_agent' : (args.note_type || 'note'),
+      caller_phone: args.caller_phone || session.from || session.fromNumber || session.customerPhone || null,
+      callback_number: args.callback_number || null,
+      caller_name: args.caller_name || null,
+      for_human_agent_id: args.for_human_agent_id || session.humanAgentId || null,
+    };
+    logger.info('[v12.1.0-A.16] take_note enriched', {
+      callSid: session.callSid,
+      isRecovery: !!session.isRecovery,
+      finalNoteType: enriched.note_type,
+      hasCallerPhone: !!enriched.caller_phone,
+      hasHumanAgentId: !!enriched.for_human_agent_id,
+    });
+    return enriched;
   }
 
   static _sendToolResult(session, callId, result, toolName) {
@@ -4012,10 +4109,29 @@ class OpenAIHandler {
               logger.info("[v6.4.0] Voicemail safety timer cancelled — human answered", { callSid: session.callSid });
             }
 
-            // Language detection
-            const detectedLang = LanguageDetector.detect(event.transcript);
-            if (detectedLang && detectedLang !== session.language) {
-              await LanguageDetector.updateSessionLanguage(session, detectedLang);
+            // A.17: First-turn customer language detection (locks after first STT)
+            if (!session.customerLangLocked) {
+              const text = (event.transcript || '').trim();
+              if (text.length >= 2) {
+                const detected = detectLang(text, session.activeLang);
+                session.customerLang = detected;
+                session.languageSource = 'stt';
+                session.customerLangLocked = true;
+                logger.info('[lang_detect] customer language detected', {
+                  callSid: session.callSid,
+                  detected,
+                  sample: text.slice(0, 60),
+                });
+                if (detected !== session.activeLang) {
+                  await applyLanguageSwitch(session, detected);
+                }
+              }
+            } else {
+              // Subsequent turns: use existing LanguageDetector for mid-call switches (future A.18)
+              const detectedLang = LanguageDetector.detect(event.transcript);
+              if (detectedLang && detectedLang !== session.language) {
+                await LanguageDetector.updateSessionLanguage(session, detectedLang);
+              }
             }
 
             // ✅ v6.3.0 POINT D: Track user turn count
@@ -5281,8 +5397,8 @@ class TwilioHandler {
       session.recoveryLang = recoveryLang;
       const fm = session.dynamicFirstMessage;
       const recoveryPrompt = recoveryLang.startsWith('es')
-        ? `Eres un asistente de recepci\u00f3n. El agente humano no est\u00e1 disponible.\nREGLAS ABSOLUTAS:\n- Tu PRIMERA frase debe ser EXACTAMENTE: "${fm}"\n- NO te presentes, NO digas tu nombre, NO digas "gracias por llamar".\n- Despu\u00e9s, si el cliente quiere dejar un mensaje, toma nombre, n\u00famero y motivo, y usa la tool take_note.\n- Si el cliente se despide, usa end_call.\n- Habla SIEMPRE en espa\u00f1ol.`
-        : `You are a recovery receptionist. The human agent is unavailable.\nABSOLUTE RULES:\n- Your FIRST sentence MUST be EXACTLY: "${fm}"\n- Do NOT introduce yourself, do NOT say your name, do NOT say "thanks for calling".\n- After that, if the caller wants to leave a message, capture name, callback number and reason, then call take_note.\n- If the caller says goodbye, call end_call.\n- Always speak in English.`;
+        ? `Eres un asistente de recepci\u00f3n. El agente humano no est\u00e1 disponible.\nREGLAS ABSOLUTAS:\n- Tu PRIMERA frase debe ser EXACTAMENTE: "${fm}"\n- NO te presentes, NO digas tu nombre, NO digas "gracias por llamar".\n- Habla SIEMPRE en espa\u00f1ol.\n\nSI EL CLIENTE QUIERE DEJAR UN MENSAJE:\n1. Di: "Puedo tomarle un mensaje para el agente. Por favor d\u00edgame su nombre, el mejor n\u00famero para devolverle la llamada y el motivo de su llamada."\n2. Cuando el cliente diga el n\u00famero, rep\u00edtelo d\u00edgito por d\u00edgito: "Le repito el n\u00famero: [d\u00edgitos]. \u00bfEs correcto?"\n3. Confirma: "Perfecto, le voy a enviar este mensaje al agente ahora mismo."\n4. Llama take_note con note_type="message_for_agent" y el mensaje completo (nombre, n\u00famero, motivo).\n5. Desp\u00eddate brevemente y llama end_call.\n- Si el cliente se despide sin dejar mensaje, llama end_call directamente.`
+        : `You are a recovery receptionist. The human agent is unavailable.\nABSOLUTE RULES:\n- Your FIRST sentence MUST be EXACTLY: "${fm}"\n- Do NOT introduce yourself, do NOT say your name, do NOT say "thanks for calling".\n- Always speak in English.\n\nIF THE CALLER WANTS TO LEAVE A MESSAGE:\n1. Say: "I can take a message for the agent. Please tell me your name, the best callback number, and the reason for your call."\n2. When the caller gives the number, repeat it digit by digit: "Let me repeat the number: [digits]. Is that correct?"\n3. Confirm: "Perfect, I'm sending this message to the agent right now."\n4. Call take_note with note_type="message_for_agent" and the full message (name, number, reason).\n5. Say goodbye briefly and call end_call.\n- If the caller says goodbye without leaving a message, call end_call directly.`;
       // Override instructions — mode=full so it replaces the full agent prompt
       session.dynamicInstructions = recoveryPrompt;
       session.dynamicInstructionsMode = 'full';
