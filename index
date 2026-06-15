@@ -5942,6 +5942,7 @@ class HealthCheck {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const path = url.pathname;
+  const urlParams = url.searchParams; // ✅ FIX: make query params available to all HTTP route handlers
 
   // ✅ FIX SEC-1: Restrict CORS to configured origins
   const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "").split(",").filter(Boolean);
