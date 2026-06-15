@@ -1348,6 +1348,18 @@ class SupabaseClient {
             humanAgents = [COMPANY_HUMAN_FALLBACK[effectiveCompanyId]];
           }
           config.humanAgents = humanAgents;
+          // A.5: Log actual result so we can see count + phones in Render logs
+          logger.info('[transfer_to_human] human loader loaded', {
+            companyId: effectiveCompanyId,
+            count: humanAgents.length,
+            humans: humanAgents.map(h => ({
+              id: h.id,
+              name: h.name,
+              hasPhone: Boolean(h.phone),
+              availability: h.availability || h.current_availability || null,
+              fromFallback: h.fromFallback || false,
+            })),
+          });
         } catch (humanErr) {
           logger.error("[transfer_to_human] human loader error", {
             companyId: effectiveCompanyId, error: humanErr.message,
@@ -3297,6 +3309,15 @@ class ToolExecutor {
   }
 
   static async _executeTransfer(session, args) {
+    // A.5: First log — if this doesn't appear, the tool dispatcher never reached here.
+    logger.info('[transfer_to_human] tool invoked', {
+      callSid: session?.callSid,
+      companyId: session?.companyId,
+      agentId: session?.agentId,
+      args,
+      humanAgentsCount: session?.config?.humanAgents?.length || 0,
+    });
+
     // v12.1.1 Phase A — call bc-transfer-call v3.0 directly.
     // No agent-router claim, no screening orchestrator, no <Dial><Number>.
     if (session.transferInProgress) {
@@ -3475,50 +3496,58 @@ class ToolExecutor {
             session.interpreterRuntimeListener.start();
           }
 
-          // Update call record (non-critical) — v12.1.3: use voicecore_calls, log errors
+          // A.7: persistPostTransfer — correct column names per confirmed DB schema.
+          // public.calls            → twilio_call_sid (NOT call_sid)
+          // public.voicecore_calls  → provider_call_sid (NOT call_sid), NO transferred_to_agent_id/call_state at root
           (async () => {
-            const patchPayload = {
-              transferred_to_agent_id: resolvedHumanAgentId,
-              call_state: "transferred",
-            };
-            // Try voicecore_calls first (primary table post-v12)
+            const nowIso = new Date().toISOString();
+
+            // 1) public.calls — columns: twilio_call_sid, transferred_to_agent_id, call_state, status
             try {
               const r1 = await SupabaseClient.request(
-                "voicecore_calls?call_sid=eq." + callSid, "PATCH", patchPayload
+                "calls?twilio_call_sid=eq." + encodeURIComponent(callSid), "PATCH", {
+                  transferred_to_agent_id: resolvedHumanAgentId,
+                  call_state: "transferred",
+                  status: "transferred",
+                }
               );
               if (r1.ok) {
-                logger.info("[transfer_to_human] call_record_patched", {
-                  callSid, table: "voicecore_calls",
+                logger.info("[transfer_to_human] calls patched", { callSid, humanAgentId: resolvedHumanAgentId });
+              } else {
+                logger.warn("[transfer_to_human] calls patch skipped", {
+                  callSid, status: r1.status, body: r1.data,
                 });
-                return;
               }
-              logger.warn("[transfer_to_human] voicecore_calls PATCH failed", {
-                callSid, table: "voicecore_calls", status: r1.status,
-                payload: patchPayload, body: r1.data,
-              });
             } catch (e1) {
-              logger.warn("[transfer_to_human] voicecore_calls PATCH exception", {
-                callSid, error: e1.message,
+              logger.warn("[transfer_to_human] calls patch skipped", {
+                callSid, err: String(e1?.message || e1),
               });
             }
-            // Fallback: try legacy calls table
+
+            // 2) public.voicecore_calls — columns: provider_call_sid, status, metadata
+            //    NO transferred_to_agent_id or call_state at root level
             try {
               const r2 = await SupabaseClient.request(
-                "calls?call_sid=eq." + callSid, "PATCH", patchPayload
+                "voicecore_calls?provider_call_sid=eq." + encodeURIComponent(callSid), "PATCH", {
+                  status: "transferred",
+                  metadata: {
+                    transferred_to_agent_id: resolvedHumanAgentId,
+                    transfer_call_state: "transferred",
+                    transfer_number: resolvedTransferNumber,
+                    transfer_at: nowIso,
+                  },
+                }
               );
               if (r2.ok) {
-                logger.info("[transfer_to_human] call_record_patched", {
-                  callSid, table: "calls",
+                logger.info("[transfer_to_human] voicecore_calls patched", { callSid });
+              } else {
+                logger.warn("[transfer_to_human] voicecore_calls patch skipped", {
+                  callSid, status: r2.status, body: r2.data,
                 });
-                return;
               }
-              logger.warn("[transfer_to_human] calls PATCH failed", {
-                callSid, table: "calls", status: r2.status,
-                payload: patchPayload, body: r2.data,
-              });
             } catch (e2) {
-              logger.warn("[transfer_to_human] calls PATCH exception", {
-                callSid, error: e2.message,
+              logger.warn("[transfer_to_human] voicecore_calls patch skipped", {
+                callSid, err: String(e2?.message || e2),
               });
             }
           })();
@@ -3665,6 +3694,12 @@ class ToolExecutor {
       additionalToolNames: additionalValid.map(t => t.name),
       droppedAdditional: additionalDropped,
       finalToolCount: finalTools.length,
+    });
+
+    // A.5: Log final tool names so we can confirm transfer_to_human is registered
+    logger.info('[realtime-tools] final tool names', {
+      callSid: session?.callSid || 'prewarm',
+      names: finalTools.map(t => t.name || t.function?.name),
     });
 
     return finalTools;
