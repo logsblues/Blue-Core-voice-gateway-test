@@ -1095,6 +1095,48 @@ setInterval(cleanupExpiredPrewarmSessions, 60_000); // ✅ v7.3.5: check every 6
 // SECTION 5: EXTERNAL SERVICES
 // ============================================================
 
+// A.9.2 — DB column whitelists to prevent 400 errors from unknown columns
+// Confirmed schema for public.calls
+const CALLS_ALLOWED_COLUMNS = new Set([
+  'call_sid', 'twilio_call_sid', 'status', 'direction', 'from_number', 'to_number',
+  'company_id', 'agent_id', 'duration_seconds', 'ended_at',
+  'recording_url', 'transcript', 'disposition', 'updated_at',
+  'transferred_to_agent_id', 'call_state',
+]);
+
+// Confirmed schema for public.voicecore_calls
+const VOICECORE_CALLS_ALLOWED_COLUMNS = new Set([
+  'provider_call_sid', 'status', 'metadata', 'company_id', 'agent_id',
+  'direction', 'from_number', 'to_number', 'started_at', 'ended_at',
+  'duration_seconds', 'updated_at',
+]);
+
+function sanitizeCallsPayload(payload) {
+  const clean = {};
+  const dropped = [];
+  for (const [k, v] of Object.entries(payload || {})) {
+    if (CALLS_ALLOWED_COLUMNS.has(k)) clean[k] = v;
+    else dropped.push(k);
+  }
+  if (dropped.length > 0) {
+    logger.debug('[db] sanitizeCallsPayload dropped unknown columns', { dropped });
+  }
+  return clean;
+}
+
+function sanitizeVoicecorePayload(payload) {
+  const clean = {};
+  const dropped = [];
+  for (const [k, v] of Object.entries(payload || {})) {
+    if (VOICECORE_CALLS_ALLOWED_COLUMNS.has(k)) clean[k] = v;
+    else dropped.push(k);
+  }
+  if (dropped.length > 0) {
+    logger.debug('[db] sanitizeVoicecorePayload dropped unknown columns', { dropped });
+  }
+  return clean;
+}
+
 /**
  * SupabaseClient - Interact with Supabase REST API (with Circuit Breaker + Retry)
  */
@@ -3504,19 +3546,27 @@ class ToolExecutor {
 
             // 1) public.calls — columns: twilio_call_sid, transferred_to_agent_id, call_state, status
             try {
-              const r1 = await SupabaseClient.request(
-                "calls?twilio_call_sid=eq." + encodeURIComponent(callSid), "PATCH", {
-                  transferred_to_agent_id: resolvedHumanAgentId,
-                  call_state: "transferred",
-                  status: "transferred",
-                }
-              );
-              if (r1.ok) {
-                logger.info("[transfer_to_human] calls patched", { callSid, humanAgentId: resolvedHumanAgentId });
+              const callsRaw = {
+                transferred_to_agent_id: resolvedHumanAgentId,
+                call_state: "transferred",
+                status: "transferred",
+              };
+              const callsClean = sanitizeCallsPayload(callsRaw);
+              if (Object.keys(callsClean).length === 0) {
+                logger.info('[db] skip empty calls patch', { callSid, droppedKeys: Object.keys(callsRaw) });
               } else {
-                logger.warn("[transfer_to_human] calls patch skipped", {
-                  callSid, status: r1.status, body: r1.data,
-                });
+                const r1 = await SupabaseClient.request(
+                  "calls?twilio_call_sid=eq." + encodeURIComponent(callSid), "PATCH", callsClean
+                );
+                if (r1.ok) {
+                  logger.info("[transfer_to_human] calls patched", { callSid, humanAgentId: resolvedHumanAgentId });
+                } else {
+                  logger.warn("[transfer_to_human] calls patch skipped", {
+                    callSid, status: r1.status, message: r1.data?.message,
+                    details: r1.data?.details, hint: r1.data?.hint,
+                    payloadKeys: Object.keys(callsClean),
+                  });
+                }
               }
             } catch (e1) {
               logger.warn("[transfer_to_human] calls patch skipped", {
@@ -3527,23 +3577,31 @@ class ToolExecutor {
             // 2) public.voicecore_calls — columns: provider_call_sid, status, metadata
             //    NO transferred_to_agent_id or call_state at root level
             try {
-              const r2 = await SupabaseClient.request(
-                "voicecore_calls?provider_call_sid=eq." + encodeURIComponent(callSid), "PATCH", {
-                  status: "transferred",
-                  metadata: {
-                    transferred_to_agent_id: resolvedHumanAgentId,
-                    transfer_call_state: "transferred",
-                    transfer_number: resolvedTransferNumber,
-                    transfer_at: nowIso,
-                  },
-                }
-              );
-              if (r2.ok) {
-                logger.info("[transfer_to_human] voicecore_calls patched", { callSid });
+              const vcRaw = {
+                status: "transferred",
+                metadata: {
+                  transferred_to_agent_id: resolvedHumanAgentId,
+                  transfer_call_state: "transferred",
+                  transfer_number: resolvedTransferNumber,
+                  transfer_at: nowIso,
+                },
+              };
+              const vcClean = sanitizeVoicecorePayload(vcRaw);
+              if (Object.keys(vcClean).length === 0) {
+                logger.info('[db] skip empty voicecore_calls patch', { callSid, droppedKeys: Object.keys(vcRaw) });
               } else {
-                logger.warn("[transfer_to_human] voicecore_calls patch skipped", {
-                  callSid, status: r2.status, body: r2.data,
-                });
+                const r2 = await SupabaseClient.request(
+                  "voicecore_calls?provider_call_sid=eq." + encodeURIComponent(callSid), "PATCH", vcClean
+                );
+                if (r2.ok) {
+                  logger.info("[transfer_to_human] voicecore_calls patched", { callSid });
+                } else {
+                  logger.warn("[transfer_to_human] voicecore_calls patch skipped", {
+                    callSid, status: r2.status, message: r2.data?.message,
+                    details: r2.data?.details, hint: r2.data?.hint,
+                    payloadKeys: Object.keys(vcClean),
+                  });
+                }
               }
             } catch (e2) {
               logger.warn("[transfer_to_human] voicecore_calls patch skipped", {
@@ -5025,19 +5083,30 @@ class TwilioHandler {
       const participantType = params.participantType || params.participant_type || null; // 'customer' | 'agent'
 
       if (participantStatus === 'joined' || params.customerJoined === 'true') {
-        logger.info('[conference] conference_participant_joined_customer', {
+        // A.9.3: Standard conference lifecycle event names
+        logger.info('[conference] customer_joined_conference', {
           callSid: session.callSid, conferenceName: bridgeConferenceName,
-          customerCallSid: bridgeCustomerCallSid,
+          customerCallSid: bridgeCustomerCallSid, ts: new Date().toISOString(),
         });
       }
       if (participantStatus === 'agent_joined' || params.agentJoined === 'true') {
-        logger.info('[conference] conference_participant_joined_agent', {
+        logger.info('[conference] agent_joined_conference', {
           callSid: session.callSid, conferenceName: bridgeConferenceName,
-          agentCallSid: participantCallSid,
+          agentCallSid: participantCallSid, ts: new Date().toISOString(),
         });
         logger.info('[conference] agent_answered', {
           callSid: session.callSid, conferenceName: bridgeConferenceName,
           agentCallSid: participantCallSid,
+        });
+        // Both participants joined → bridge is active
+        logger.info('[conference] bridge_connected', {
+          callSid: session.callSid, conferenceName: bridgeConferenceName,
+          customerCallSid: bridgeCustomerCallSid, agentCallSid: participantCallSid,
+          ts: new Date().toISOString(),
+        });
+        logger.info('[conference] human_bridge_active', {
+          callSid: session.callSid, conferenceName: bridgeConferenceName,
+          ts: new Date().toISOString(),
         });
       }
       if (participantStatus === 'agent_no_answer' || params.agentNoAnswer === 'true') {
