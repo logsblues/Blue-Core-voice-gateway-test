@@ -3141,6 +3141,24 @@ class EnforcementOrchestrator {
   }
 }
 
+// A.17c: Guard helpers — prevent invented/assistant-generated text from becoming CRM notes
+function isAssistantGeneratedMessage(text) {
+  const t = String(text).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+  return /^(thank you\.?\s*)?perfect,? i'?m sending (this|the) message/.test(t)
+    || /^(gracias\.?\s*)?perfecto,? (le )?(voy a enviar|enviare) (este|el) mensaje/.test(t)
+    || /i can take a message for the agent/.test(t)
+    || /puedo tomar(le|te)? un mensaje/.test(t)
+    || /would you like to leave a message/.test(t)
+    || /quieres dejar un mensaje|quiere dejar un mensaje/.test(t);
+}
+function hasExplicitCallerMessage(text) {
+  const t = String(text).trim();
+  if (t.length < 3) return false;
+  if (/^(bye|goodbye|adios|adi[oó]s|no|no gracias|ok|okay|yes|si|s[ií]|thanks|thank you)[.!?\s]*$/i.test(t)) return false;
+  if (isAssistantGeneratedMessage(t)) return false;
+  return true;
+}
+
 class ToolExecutor {
   static getCustomerPhone(session, args) {
     const phone = args.phone || session.customerPhone ||
@@ -3193,9 +3211,31 @@ class ToolExecutor {
 
     let result;
 
-    // A.16: Enrich take_note args with session fields before dispatch
+     // A.16: Enrich take_note args with session fields before dispatch
     if (toolName === 'take_note') {
       args = ToolExecutor._injectMessageForAgentDefaults(toolName, args, session);
+    }
+
+    // A.17c: Block unconfirmed message_for_agent notes (invented/assistant-generated text)
+    if (toolName === 'take_note' && (args.note_type === 'message_for_agent' || session.isRecovery)) {
+      const noteText = args.note || args.content || args.description || args.message || '';
+      if (!hasExplicitCallerMessage(noteText)) {
+        logger.warn('[v12.1.0-A.17c] blocked unconfirmed message_for_agent', {
+          callSid: session.callSid,
+          isRecovery: !!session.isRecovery,
+          hasNoteText: !!noteText,
+          notePreview: String(noteText).slice(0, 80),
+        });
+        const blockedResult = {
+          success: false,
+          error: 'UNCONFIRMED_MESSAGE_FOR_AGENT',
+          message: session.activeLang === 'es'
+            ? 'No guard\u00e9 mensaje porque el cliente no dict\u00f3 un mensaje expl\u00edcito.'
+            : 'I did not save a message because the caller did not dictate an explicit message.',
+        };
+        ToolExecutor._sendToolResult(session, callId, blockedResult, toolName);
+        return blockedResult;
+      }
     }
 
     try {
@@ -3684,7 +3724,7 @@ class ToolExecutor {
             callerPhone: session.from || session.fromNumber || session.customerPhone || null,
             callerName: session.contactName || session.preloadedContact?.name || null,
             humanAgentId: resolvedHumanAgentId,
-            humanAgentName: resolvedHumanAgentName,
+            humanAgentName: resolvedTargetAgent?.name || resolvedTargetAgent?.display_name || requestedAgentName || null,
             companyId: session.companyId,
             aiAgentId: session.agentId,
           };
@@ -5449,8 +5489,18 @@ class TwilioHandler {
       session.recoveryLang = recoveryLang;
       const fm = session.dynamicFirstMessage;
       const recoveryPrompt = recoveryLang.startsWith('es')
-        ? `Eres un asistente de recepci\u00f3n. El agente humano no est\u00e1 disponible.\nREGLAS ABSOLUTAS:\n- Tu PRIMERA frase debe ser EXACTAMENTE: "${fm}"\n- NO te presentes, NO digas tu nombre, NO digas "gracias por llamar".\n- Habla SIEMPRE en espa\u00f1ol.\n\nSI EL CLIENTE QUIERE DEJAR UN MENSAJE:\n1. Di: "Puedo tomarle un mensaje para el agente. Por favor d\u00edgame su nombre, el mejor n\u00famero para devolverle la llamada y el motivo de su llamada."\n2. Cuando el cliente diga el n\u00famero, rep\u00edtelo d\u00edgito por d\u00edgito: "Le repito el n\u00famero: [d\u00edgitos]. \u00bfEs correcto?"\n3. Confirma: "Perfecto, le voy a enviar este mensaje al agente ahora mismo."\n4. Llama take_note con note_type="message_for_agent" y el mensaje completo (nombre, n\u00famero, motivo).\n5. Desp\u00eddate brevemente y llama end_call.\n- Si el cliente se despide sin dejar mensaje, llama end_call directamente.`
-        : `You are a recovery receptionist. The human agent is unavailable.\nABSOLUTE RULES:\n- Your FIRST sentence MUST be EXACTLY: "${fm}"\n- Do NOT introduce yourself, do NOT say your name, do NOT say "thanks for calling".\n- Always speak in English.\n\nIF THE CALLER WANTS TO LEAVE A MESSAGE:\n1. Say: "I can take a message for the agent. Please tell me your name, the best callback number, and the reason for your call."\n2. When the caller gives the number, repeat it digit by digit: "Let me repeat the number: [digits]. Is that correct?"\n3. Confirm: "Perfect, I'm sending this message to the agent right now."\n4. Call take_note with note_type="message_for_agent" and the full message (name, number, reason).\n5. Say goodbye briefly and call end_call.\n- If the caller says goodbye without leaving a message, call end_call directly.`;
+        ? `Eres un asistente de recepci\u00f3n. El agente humano no est\u00e1 disponible.\nREGLAS ABSOLUTAS:\n- Tu PRIMERA frase debe ser EXACTAMENTE: "${fm}"\n- NO te presentes, NO digas tu nombre, NO digas "gracias por llamar".\n- Habla SIEMPRE en espa\u00f1ol.\n\nSI EL CLIENTE QUIERE DEJAR UN MENSAJE:\n1. Di: "Puedo tomarle un mensaje para el agente. Por favor d\u00edgame su nombre, el mejor n\u00famero para devolverle la llamada y el motivo de su llamada."\n2. Cuando el cliente diga el n\u00famero, rep\u00edtelo d\u00edgito por d\u00edgito: "Le repito el n\u00famero: [d\u00edgitos]. \u00bfEs correcto?"\n3. Confirma: "Perfecto, le voy a enviar este mensaje al agente ahora mismo."\n4. Llama take_note con note_type="message_for_agent" y el mensaje completo (nombre, n\u00famero, motivo).\n5. Desp\u00eddate brevemente y llama end_call.\n- Si el cliente se despide sin dejar mensaje, llama end_call directamente.
+Nunca inventes, resumas ni asumas un mensaje por el cliente.
+Solo llama take_note despu\u00e9s de que el cliente dicte contenido expl\u00edcito del mensaje con sus propias palabras.
+Si el cliente solo dice s\u00ed/no/adi\u00f3s/gracias, no llames take_note.
+Si el cliente quiere dejar un mensaje pero todav\u00eda no lo dict\u00f3, pide una vez el mensaje exacto y espera.
+No digas que el mensaje se est\u00e1 enviando hasta que take_note haya sido exitoso.`
+        : `You are a recovery receptionist. The human agent is unavailable.\nABSOLUTE RULES:\n- Your FIRST sentence MUST be EXACTLY: "${fm}"\n- Do NOT introduce yourself, do NOT say your name, do NOT say "thanks for calling".\n- Always speak in English.\n\nIF THE CALLER WANTS TO LEAVE A MESSAGE:\n1. Say: "I can take a message for the agent. Please tell me your name, the best callback number, and the reason for your call."\n2. When the caller gives the number, repeat it digit by digit: "Let me repeat the number: [digits]. Is that correct?"\n3. Confirm: "Perfect, I'm sending this message to the agent right now."\n4. Call take_note with note_type="message_for_agent" and the full message (name, number, reason).\n5. Say goodbye briefly and call end_call.\n- If the caller says goodbye without leaving a message, call end_call directly.
+Never invent, summarize, or assume a message for the caller.
+Only call take_note after the caller provides explicit message content in their own words.
+If the caller says only yes/no/bye/thanks, do not call take_note.
+If the caller wants to leave a message but has not dictated it yet, ask once for the exact message and wait.
+Do not say the message is being sent until take_note succeeds.`;
       // Override instructions — mode=full so it replaces the full agent prompt
       session.dynamicInstructions = recoveryPrompt;
       session.dynamicInstructionsMode = 'full';
