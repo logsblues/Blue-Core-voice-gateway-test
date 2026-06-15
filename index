@@ -4427,6 +4427,13 @@ class InterpreterRuntimeListener {
         return;
       }
 
+      // A.12.1: Pause poller while human bridge is active (no interpreter prepId yet)
+      // Avoids interpreter_flag_polled_no_row spam during Conference.
+      if (session.humanBridgeActive && !prepId) {
+        this._schedule(); // keep timer alive but skip Supabase query
+        return;
+      }
+
       // v7.5.1 FIX: Query bc_call_prep_sessions (primary) where bc-activate-interpreter writes
       // Falls back to call_prep_sessions if bc_ table returns no row.
       let row = null;
@@ -6405,6 +6412,8 @@ const server = http.createServer(async (req, res) => {
       let body = "";
       req.on("data", chunk => body += chunk);
       req.on("end", () => {
+        // A.12.1: always log raw body for diagnosis
+        logger.info("[conference-status] event_received", { rawBody: body, ts: new Date().toISOString() });
         try {
           const params = new URLSearchParams(body);
           const event = params.get("StatusCallbackEvent") || "";
@@ -6413,7 +6422,7 @@ const server = http.createServer(async (req, res) => {
           const friendlyName = params.get("FriendlyName") || urlParams.get("callSid") || "";
           const participantCount = parseInt(params.get("ParticipantCount") || "0", 10);
           const ts = new Date().toISOString();
-          const ctx = { callSid, conferenceSid, friendlyName, participantCount, ts };
+          const ctx = { callSid, conferenceSid, friendlyName, participantCount, event, ts };
 
           if (event === "conference-start") {
             logger.info("[conference] conference_stream_started", ctx);
@@ -6449,11 +6458,13 @@ const server = http.createServer(async (req, res) => {
       let body = "";
       req.on("data", chunk => body += chunk);
       req.on("end", async () => {
+        // A.12.1: always log raw body for diagnosis
+        logger.info("[agent-leg-status] event_received", { rawBody: body, ts: new Date().toISOString() });
         try {
           const params = new URLSearchParams(body);
           const callStatus = params.get("CallStatus") || "";
           const agentCallSid = params.get("CallSid") || "";
-          const customerCallSid = urlParams.get("customerCallSid") || "";
+          const customerCallSid = urlParams.get("customerCallSid") || params.get("ParentCallSid") || "";
           const ts = new Date().toISOString();
           const ctx = { agentCallSid, callStatus, customerCallSid, ts };
 
@@ -6545,6 +6556,20 @@ setInterval(() => {
 }, 300_000);
 
 server.listen(PORT, () => {
+  // A.12.1: structured startup log for Render diagnosis
+  const mem = process.memoryUsage();
+  logger.info("process_started", {
+    version: VERSION,
+    port: PORT,
+    pid: process.pid,
+    uptime_seconds: Math.floor(process.uptime()),
+    memory_rss_mb: Math.round(mem.rss / 1024 / 1024),
+    memory_heap_used_mb: Math.round(mem.heapUsed / 1024 / 1024),
+    render_instance_id: process.env.RENDER_INSTANCE_ID || null,
+    render_service_id: process.env.RENDER_SERVICE_ID || null,
+    node_version: process.version,
+    ts: new Date().toISOString(),
+  });
   logger.info("Voice Gateway started", { version: VERSION, port: PORT, pid: process.pid });
 
   console.log(`
