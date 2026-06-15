@@ -965,6 +965,24 @@ function _sendResponseCreateDirect(session, payload) {
   session.openaiWs.send(JSON.stringify({ type: 'response.create', ...payload }));
 }
 
+// v12.1.0-A.2: Safe response.cancel — only sends if a response is actually in flight.
+// Prevents 4xx "response_cancel_not_active" errors from OpenAI.
+function sendCancelIfActive(session, source = "cancel") {
+  if (!session?.activeResponseId || session.cancellingResponse) {
+    return false; // nothing in flight — skip silently
+  }
+  if (session.openaiWs?.readyState !== WebSocket.OPEN) {
+    return false;
+  }
+  session.cancellingResponse = true;
+  session.openaiWs.send(JSON.stringify({ type: "response.cancel" }));
+  logger.info('[v12.1.0-A.2] ' + source + ' cancel sent', {
+    callSid: session.callSid,
+    id: session.activeResponseId,
+  });
+  return true;
+}
+
 function flushResponseQueue(session) {
   if (session.activeResponseId || session.cancellingResponse) return;
   const next = session.responseQueue.shift();
@@ -1284,9 +1302,9 @@ class SupabaseClient {
         }
 
         // 6. Load human agents for transfer
-        const humanRes = await this.request("agents_new?company_id=eq." + effectiveCompanyId + "&type=eq.human&status=eq.active&availability=eq.available&select=id,display_name");  // ✅ FIX BUG-6: only available agents
+        const humanRes = await this.request("agents_new?company_id=eq." + effectiveCompanyId + "&type=eq.human&status=eq.active&availability=eq.available&select=id,display_name,phone,dial_target,transfer_number");  // ✅ FIX BUG-6: only available agents
         if (humanRes.ok && humanRes.data) {
-          config.humanAgents = humanRes.data.map(a => ({ id: a.id, name: a.display_name }));
+          config.humanAgents = humanRes.data.map(a => ({ id: a.id, name: a.display_name, phone: a.dial_target || a.phone || a.transfer_number || null }));
         }
       }
     } catch (e) {
@@ -2362,7 +2380,8 @@ function injectVoicemailScript(session) {
         session._voicemailScriptDelivered = true;
         logger.warn("[v7.3.4] 10s fallback — forcing voicemail injection", { callSid: session.callSid });
         if (session.openaiWs?.readyState === WebSocket.OPEN) {
-          session.openaiWs.send(JSON.stringify({ type: "response.cancel" }));
+          // v12.1.0-A.2: Use guarded cancel to avoid response_cancel_not_active errors
+          sendCancelIfActive(session, "voicemail_fallback");
           setTimeout(() => {
             if (session.openaiWs?.readyState === WebSocket.OPEN) {
               session.openaiWs.send(JSON.stringify({
@@ -3209,49 +3228,93 @@ class ToolExecutor {
   }
 
   static async _executeTransfer(session, args) {
-    // FIX #8: Prevent double execution
+    // v12.1.1 Phase A — call bc-transfer-call v3.0 directly.
+    // No agent-router claim, no screening orchestrator, no <Dial><Number>.
     if (session.transferInProgress) {
       logger.warn("Transfer already in progress, ignoring duplicate call", { callSid: session.callSid });
       return { success: false, error: "Transfer already in progress" };
     }
     session.transferInProgress = true;
 
-    // ── v7.3.6 FIX: suppress AI audio IMMEDIATELY before transfer ──
+    // Suppress AI audio immediately
     session.suppressModelAudio = true;
-    try {
-      session.openaiWs?.send(JSON.stringify({ type: "response.cancel" }));
-      logger.info("[TRANSFER] Cancelled active AI response before transfer", { callSid: session.callSid });
-    } catch (_) {}
+    // v12.1.0-A.2: Use guarded cancel to avoid response_cancel_not_active errors
+    sendCancelIfActive(session, "transfer_to_human");
 
     try {
-      // 1. Resolve target via agent-router edge function (availability-aware)
-      const target = await resolveTransferTarget(session, args);
-      if (!target) {
+      const callSid = session.callSid;
+      const companyId = session.companyId;
+      const aiAgentId = session.agentId;
+
+      if (!callSid || !companyId) {
         session.transferInProgress = false;
-        logger.warn("Transfer: no available agent found via agent-router", { callSid: session.callSid });
-        return { success: false, error: "No available agent found" };
+        logger.error("[transfer_to_human] missing session context", { callSid, companyId, aiAgentId });
+        return { success: false, error: "missing_session_context" };
       }
 
-      const { dialTarget, agentName, agentId, lockId } = target;
-      session.transferLockId = lockId;
-      session.transferAgentId = agentId;
+      // Resolve human agent from session.config.humanAgents
+      const normalize = (v) => String(v || "")
+        .trim().toLowerCase()
+        .normalize("NFD").replace(/[̀-ͯ]/g, "")
+        .replace(/\s+/g, " ");
+
+      const requestedAgentName = args?.agent_name || args?.agentName || args?.name || null;
+      const humanAgents = session.config?.humanAgents || [];
+      let targetAgent = null;
+
+      if (requestedAgentName) {
+        const req = normalize(requestedAgentName);
+        targetAgent = humanAgents.find((a) => normalize(a.name) === req)
+          || humanAgents.find((a) => normalize(a.name).includes(req) || req.includes(normalize(a.name)));
+      }
+      if (!targetAgent && humanAgents.length >= 1) targetAgent = humanAgents[0];
+
+      const humanAgentId = targetAgent?.id || args?.human_agent_id || args?.humanAgentId || null;
+      let transferNumber = args?.dial_target || args?.dialTarget || args?.transfer_number
+        || args?.transferTo || targetAgent?.phone || null;
+
+      // Fallback: fetch phone from agent_profiles if still missing
+      if ((!transferNumber || !String(transferNumber).trim()) && humanAgentId) {
+        try {
+          const profileResp = await fetch(
+            `${SUPABASE_URL}/rest/v1/agent_profiles?agent_id=eq.${encodeURIComponent(humanAgentId)}&select=dial_target,phone`,
+            {
+              headers: {
+                "apikey": SUPABASE_SERVICE_KEY,
+                "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
+              },
+            }
+          );
+          const profiles = await profileResp.json().catch(() => []);
+          transferNumber = profiles?.[0]?.dial_target || profiles?.[0]?.phone || null;
+        } catch (_) {}
+      }
+
+      if (!humanAgentId || !transferNumber) {
+        session.transferInProgress = false;
+        logger.warn("[transfer_to_human] no human target resolved", {
+          callSid,
+          requestedAgentName,
+          humanAgents: humanAgents.map((a) => ({ id: a.id, name: a.name, hasPhone: Boolean(a.phone) })),
+        });
+        return { success: false, error: "no_human_transfer_target" };
+      }
 
       logger.info("[transfer_to_human] resolved human target", {
-        callSid: session.callSid,
-        dialTarget,
-        humanAgentName: agentName,
-        humanAgentId: agentId,
-        sourceAiAgentId: session.agentId
+        callSid, companyId, aiAgentId, humanAgentId,
+        humanAgentName: targetAgent?.name || requestedAgentName,
+        transferNumber,
       });
 
-      // 2. Tell the AI to announce the transfer
+      // Tell the AI to announce the transfer
       if (session.openaiWs?.readyState === WebSocket.OPEN) {
+        const agentDisplayName = targetAgent?.name || requestedAgentName || "a human agent";
         session.openaiWs.send(JSON.stringify({
           type: "conversation.item.create",
           item: {
             type: "message",
             role: "user",
-            content: [{ type: "input_text", text: `[TRANSFER] Say exactly: "Transferring your call to ${agentName}, please hold." - Do NOT say anything else after this.` }]
+            content: [{ type: "input_text", text: `[TRANSFER] Say exactly: "Transferring your call to ${agentDisplayName}, please hold." - Do NOT say anything else after this.` }]
           }
         }));
         ResponseLockManager.sendResponseCreateSafe(
@@ -3261,105 +3324,91 @@ class ToolExecutor {
         );
       }
 
-      // 3. Execute bc-transfer-call v3.0 after delay for AI announcement
+      // Wait for AI announcement, then call bc-transfer-call
       session.transferTimeout = setTimeout(async () => {
         if (!session.callSid || session.sessionDestroyed) {
-          logger.warn("Session already destroyed before transfer redirect", { callSid: session.callSid || "unknown" });
+          logger.warn("[transfer_to_human] session destroyed before transfer", { callSid });
           return;
         }
-
         session.callEnding = true;
 
         try {
           logger.info("[transfer_to_human] invoking bc-transfer-call v3.0", {
-            callSid: session.callSid,
-            dial_target: dialTarget,
-            company_id: session.companyId,
-            agent_id: agentId,
-            source_ai_agent_id: session.agentId
+            callSid, companyId, aiAgentId, humanAgentId, transferNumber,
           });
 
-          const transferRes = await fetch(`${SUPABASE_URL}/functions/v1/bc-transfer-call`, {
+          const resp = await fetch(`${SUPABASE_URL}/functions/v1/bc-transfer-call`, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`
+              "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
             },
             body: JSON.stringify({
-              callSid: session.callSid,
-              dial_target: dialTarget,
-              company_id: session.companyId,
-              agent_id: agentId,
-              source_ai_agent_id: session.agentId
-            })
+              callSid,
+              dial_target: transferNumber,
+              company_id: companyId,
+              agent_id: humanAgentId,
+              ai_agent_id: aiAgentId,
+              agent_name: targetAgent?.name || requestedAgentName || null,
+              reason: args?.reason || null,
+            }),
           });
 
-          if (!transferRes.ok) {
-            const errText = await transferRes.text();
+          const result = await resp.json().catch(() => ({}));
+          if (!resp.ok || !result?.success) {
             logger.error("[transfer_to_human] bc-transfer-call failed", {
-              callSid: session.callSid,
-              status: transferRes.status,
-              error: errText
+              callSid, status: resp.status, result,
             });
-            releaseAgentOnCallEnd(session).catch(() => {});
-          } else {
-            logger.info("[transfer_to_human] bc-transfer-call success", { callSid: session.callSid });
-            
-            // v7.5.0: Activate interpreter voice command detection on agent leg
-            session.humanBridgeActive = true;
-            session.customerCallSid = session.callSid; // customer is the parent leg
-            if (!session.agentVoiceDetector) {
-              session.agentVoiceDetector = new AgentVoiceCommandDetector(session);
-              session.agentVoiceDetector.start();
-              logger.info('[interpreter-voice] detector_started_on_transfer', {
-                callSid: session.callSid,
-                companyId: session.companyId,
-                agentId: session.agentId,
-                dialTarget,
-              });
-            }
-            // v7.5.1: Start runtime listener to poll for interpreter_enabled flag
-            if (!session.interpreterRuntimeListener) {
-              session.interpreterRuntimeListener = new InterpreterRuntimeListener(session);
-              session.interpreterRuntimeListener.start();
-            }
+            session.transferInProgress = false;
+            return;
           }
 
-          // 4. Update call record (non-critical)
-          try {
-            await SupabaseClient.request("calls?call_sid=eq." + session.callSid, "PATCH", {
-              transferred_to_agent_id: agentId,
-              call_state: "transferred"
-            });
-          } catch (e) { /* non-critical */ }
+          logger.info("[transfer_to_human] bc-transfer-call success", { callSid, result });
 
-          // 5. Close WebSockets after redirect takes effect
-          // v7.5.1 FIX: If humanBridgeActive, keep twilioWs alive so AgentVoiceCommandDetector
-          // can continue receiving audio from the agent leg. Only close openaiWs (AI no longer needed).
-          // Phase A requirement: Do not close session.twilioWs manually after transfer.
+          // Activate interpreter voice detection on agent leg
+          session.humanBridgeActive = true;
+          session.customerCallSid = callSid;
+          if (!session.agentVoiceDetector) {
+            session.agentVoiceDetector = new AgentVoiceCommandDetector(session);
+            session.agentVoiceDetector.start();
+            logger.info("[interpreter-voice] detector_started_on_transfer", {
+              callSid, companyId, agentId: aiAgentId, transferNumber,
+            });
+          }
+          if (!session.interpreterRuntimeListener) {
+            session.interpreterRuntimeListener = new InterpreterRuntimeListener(session);
+            session.interpreterRuntimeListener.start();
+          }
+
+          // Update call record (non-critical)
+          try {
+            await SupabaseClient.request("calls?call_sid=eq." + callSid, "PATCH", {
+              transferred_to_agent_id: humanAgentId,
+              call_state: "transferred",
+            });
+          } catch (_) {}
+
+          // Close OpenAI WS; keep Twilio WS alive for agent voice detection.
+          // Phase A: do NOT close session.twilioWs manually.
           setTimeout(() => {
             if (session.openaiWs?.readyState === WebSocket.OPEN) {
               session.openaiWs.close(1000, "transfer");
-              logger.info('[interpreter-voice] openai_ws_closed_post_transfer', { callSid: session.callSid });
+              logger.info("[interpreter-voice] openai_ws_closed_post_transfer", { callSid });
             }
             if (session.humanBridgeActive) {
-              // Keep Twilio WS alive for agent voice command detection
-              logger.info('[interpreter-voice] interpreter_voice_listener_started', {
-                callSid: session.callSid,
-                companyId: session.companyId,
-                agentId: session.agentId,
-                ts: new Date().toISOString(),
+              logger.info("[interpreter-voice] interpreter_voice_listener_started", {
+                callSid, companyId, agentId: aiAgentId, ts: new Date().toISOString(),
               });
             }
           }, 2000);
 
-        } catch (transferErr) {
-          logger.error("[transfer_to_human] bc-transfer-call exception", { callSid: session.callSid, error: transferErr.message });
-          releaseAgentOnCallEnd(session).catch(() => {});
+        } catch (err) {
+          logger.error("[transfer_to_human] bc-transfer-call exception", { callSid, error: err.message });
+          session.transferInProgress = false;
         }
-      }, 2500); // Wait 2.5s for AI announcement before transfer
+      }, 2500);
 
-      return { success: true, transfer_to: dialTarget, agent_name: agentName, action: "transfer" };
+      return { success: true, transfer_to: transferNumber, agent_name: targetAgent?.name || requestedAgentName, action: "transfer" };
 
     } catch (e) {
       session.transferInProgress = false;
@@ -4062,6 +4111,7 @@ class InterpreterRuntimeListener {
     this._timer = null;
     this._active = false;
     this._pollIntervalMs = 3000;
+    this._startedAt = Date.now(); // v12.1.0-A.2: track start time for no-prepId timeout
   }
 
   start() {
@@ -4093,6 +4143,15 @@ class InterpreterRuntimeListener {
       const callSid = session.callSid;
       const prepId = session.prepId;
       if (!callSid && !prepId) { this._schedule(); return; }
+
+      // v12.1.0-A.2: If no prepId after 30s, give up to avoid infinite poll leak
+      if (!prepId && (Date.now() - this._startedAt) > 30_000) {
+        logger.info('[interpreter-voice] poller_giving_up_no_prepid', {
+          callSid, ts: new Date().toISOString(),
+        });
+        this.stop();
+        return;
+      }
 
       // v7.5.1 FIX: Query bc_call_prep_sessions (primary) where bc-activate-interpreter writes
       // Falls back to call_prep_sessions if bc_ table returns no row.
@@ -4130,9 +4189,13 @@ class InterpreterRuntimeListener {
       }
 
       if (!row) {
-        logger.warn('[interpreter-voice] interpreter_flag_polled_no_row', {
-          callSid, prepId, ts: new Date().toISOString(),
-        });
+        // v12.1.2: Only warn when prepId is set — bridge sessions have no prepId and
+        // should not spam logs with interpreter_flag_polled_no_row every 3 seconds.
+        if (prepId) {
+          logger.warn('[interpreter-voice] interpreter_flag_polled_no_row', {
+            callSid, prepId, ts: new Date().toISOString(),
+          });
+        }
         this._schedule();
         return;
       }
@@ -4729,6 +4792,34 @@ class TwilioHandler {
     session.agentId = params.agentId || params.agent_id || params.agentid || session.agentId;
     session.companyId = params.companyId || params.company_id || params.companyid || session.companyId;
 
+    // ── v12.1.2: interpreter_bridge mode guard ──────────────────────────────
+    // bc-transfer-call v3.0 emits a second <Start><Stream> with mode=interpreter_bridge
+    // after redirecting the customer to the conference. This stream must NOT trigger
+    // a new greeting or agent config load — it is a listen-only bridge attachment.
+    const streamMode = params.mode || null;
+    const isBridge = streamMode === 'interpreter_bridge';
+    if (isBridge) {
+      const bridgeConferenceName = params.conferenceName || params.conference_name || null;
+      const bridgeCustomerCallSid = params.customerCallSid || params.customer_call_sid || null;
+      logger.info('[v12.1.2] interpreter_bridge stream attached — skipping greeting', {
+        callSid: session.callSid,
+        conferenceName: bridgeConferenceName,
+        customerCallSid: bridgeCustomerCallSid,
+        agentId: session.agentId,
+        companyId: session.companyId,
+      });
+      session.bridgeMode = true;
+      session.skipGreeting = true;
+      session.greetingTriggered = true; // prevent any deferred greeting trigger
+      if (bridgeConferenceName) session.conferenceName = bridgeConferenceName;
+      if (bridgeCustomerCallSid) session.customerCallSid = bridgeCustomerCallSid;
+      // Register session so cleanup works correctly
+      sessions.set(session.callSid, session);
+      // Do NOT load agent config, do NOT connect to OpenAI, do NOT send response.create.
+      return;
+    }
+    // ── end v12.1.2 guard ────────────────────────────────────────────────────
+
     logger.info("Stream start", {
       callSid: session.callSid, direction: session.direction,
       from: session.fromNumber, to: session.toNumber,
@@ -5063,6 +5154,13 @@ OUTPUT FORMAT:
       CallScreeningEngine.handleCustomerHangup(session).catch(e =>
         logger.warn("[SCREENING] Hangup notification failed", { error: e.message })
       );
+    }
+
+    // v12.1.0-A.2: Stop interpreter runtime listener on stream stop to prevent poll leak
+    if (session.interpreterRuntimeListener) {
+      session.interpreterRuntimeListener.stop();
+      session.interpreterRuntimeListener = null;
+      logger.info('[interpreter-voice] poller_stopped_on_stream_stop', { callSid: session.callSid });
     }
 
     if (session.openaiWs?.readyState === WebSocket.OPEN) {
