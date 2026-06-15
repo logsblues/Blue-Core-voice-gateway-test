@@ -6394,6 +6394,114 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // ============================================================
+    // A.12: Direct conference-status + agent-leg-status webhooks
+    // (bc-transfer-call v3.1 points statusCallback here directly)
+    // ============================================================
+
+    // POST /voice/conference-status
+    // Twilio Conference statusCallback — emits the 5 lifecycle events.
+    if (path === "/voice/conference-status" && req.method === "POST") {
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", () => {
+        try {
+          const params = new URLSearchParams(body);
+          const event = params.get("StatusCallbackEvent") || "";
+          const callSid = params.get("CallSid") || "";
+          const conferenceSid = params.get("ConferenceSid") || "";
+          const friendlyName = params.get("FriendlyName") || urlParams.get("callSid") || "";
+          const participantCount = parseInt(params.get("ParticipantCount") || "0", 10);
+          const ts = new Date().toISOString();
+          const ctx = { callSid, conferenceSid, friendlyName, participantCount, ts };
+
+          if (event === "conference-start") {
+            logger.info("[conference] conference_stream_started", ctx);
+          } else if (event === "participant-join") {
+            if (participantCount === 1) {
+              logger.info("[conference] customer_joined_conference", ctx);
+            } else if (participantCount >= 2) {
+              logger.info("[conference] agent_joined_conference", ctx);
+              logger.info("[conference] bridge_connected", ctx);
+              logger.info("[conference] human_bridge_active", ctx);
+            }
+          } else if (event === "participant-leave") {
+            if (participantCount === 0) {
+              logger.info("[conference] customer_left_conference", ctx);
+            } else {
+              logger.info("[conference] conference_participant_left", ctx);
+            }
+          } else if (event === "conference-end") {
+            logger.info("[conference] conference_ended", ctx);
+          }
+        } catch (e) {
+          logger.warn("[conference] conference_status_parse_error", { error: e.message });
+        }
+        res.writeHead(204);
+        res.end();
+      });
+      return;
+    }
+
+    // POST /voice/agent-leg-status
+    // Twilio statusCallback for the outbound PSTN agent leg.
+    if (path === "/voice/agent-leg-status" && req.method === "POST") {
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", async () => {
+        try {
+          const params = new URLSearchParams(body);
+          const callStatus = params.get("CallStatus") || "";
+          const agentCallSid = params.get("CallSid") || "";
+          const customerCallSid = urlParams.get("customerCallSid") || "";
+          const ts = new Date().toISOString();
+          const ctx = { agentCallSid, callStatus, customerCallSid, ts };
+
+          if (callStatus === "ringing") {
+            logger.info("[conference] agent_ringing", ctx);
+          } else if (callStatus === "in-progress") {
+            logger.info("[conference] agent_answered", ctx);
+          } else if (["no-answer", "busy", "failed"].includes(callStatus)) {
+            logger.warn("[conference] agent_no_answer", ctx);
+            // Redirect customer to fallback TwiML
+            if (customerCallSid) {
+              const acctSid = process.env.TWILIO_ACCOUNT_SID;
+              const authToken = process.env.TWILIO_AUTH_TOKEN;
+              if (acctSid && authToken) {
+                const apiUrl = `https://api.twilio.com/2010-04-01/Accounts/${acctSid}/Calls/${customerCallSid}.json`;
+                const fallbackTwiml = `<Response><Say voice="Polly.Joanna" language="en-US">Sorry, the agent is not available right now. Please try again later.</Say><Hangup/></Response>`;
+                await fetch(apiUrl, {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Authorization": "Basic " + Buffer.from(`${acctSid}:${authToken}`).toString("base64"),
+                  },
+                  body: new URLSearchParams({ Twiml: fallbackTwiml }).toString(),
+                }).then(r => {
+                  if (r.ok) {
+                    logger.info("[conference] customer_fallback_played", { customerCallSid, reason: callStatus, ts });
+                  } else {
+                    logger.warn("[conference] customer_fallback_redirect_failed", { customerCallSid, status: r.status, ts });
+                  }
+                }).catch(err => {
+                  logger.warn("[conference] customer_fallback_redirect_failed", { customerCallSid, err: err.message, ts });
+                });
+              }
+            }
+          } else if (callStatus === "completed") {
+            logger.info("[conference] agent_call_completed", ctx);
+          } else if (callStatus === "canceled") {
+            logger.info("[conference] agent_declined_or_hangup", ctx);
+          }
+        } catch (e) {
+          logger.warn("[conference] agent_leg_status_parse_error", { error: e.message });
+        }
+        res.writeHead(204);
+        res.end();
+      });
+      return;
+    }
+
     // 404 Not Found
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Not found" }));
