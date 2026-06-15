@@ -6500,7 +6500,34 @@ const server = http.createServer(async (req, res) => {
               }
             }
           } else if (callStatus === "completed") {
-            logger.info("[conference] agent_call_completed", ctx);
+            // A.13: If completed without prior agent_accepted_transfer, treat as timeout/decline
+            const acceptedKey = `agent_accepted_${agentCallSid}`;
+            if (!global[acceptedKey]) {
+              logger.warn("[conference] agent_accept_timeout", ctx);
+              // Redirect customer to fallback
+              if (customerCallSid) {
+                const acctSid = process.env.TWILIO_ACCOUNT_SID;
+                const authToken = process.env.TWILIO_AUTH_TOKEN;
+                if (acctSid && authToken) {
+                  const apiUrl = `https://api.twilio.com/2010-04-01/Accounts/${acctSid}/Calls/${customerCallSid}.json`;
+                  const fallbackTwiml = `<Response><Say voice="Polly.Joanna" language="en-US">Sorry, the agent is not available right now. Please try again later.</Say><Hangup/></Response>`;
+                  fetch(apiUrl, {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/x-www-form-urlencoded",
+                      "Authorization": "Basic " + Buffer.from(`${acctSid}:${authToken}`).toString("base64"),
+                    },
+                    body: new URLSearchParams({ Twiml: fallbackTwiml }).toString(),
+                  }).then(r => {
+                    if (r.ok) logger.info("[conference] customer_fallback_played", { customerCallSid, reason: "agent_timeout", ts });
+                    else logger.warn("[conference] customer_fallback_redirect_failed", { customerCallSid, status: r.status, ts });
+                  }).catch(err => logger.warn("[conference] customer_fallback_redirect_failed", { customerCallSid, err: err.message, ts }));
+                }
+              }
+            } else {
+              logger.info("[conference] agent_call_completed", ctx);
+              delete global[acceptedKey];
+            }
           } else if (callStatus === "canceled") {
             logger.info("[conference] agent_declined_or_hangup", ctx);
           }
@@ -6509,6 +6536,123 @@ const server = http.createServer(async (req, res) => {
         }
         res.writeHead(204);
         res.end();
+      });
+      return;
+    }
+
+    // ============================================================
+    // A.13: Agent accept prompt — Press 1 to accept / 2 to decline
+    // Called by Twilio when the outbound agent leg answers.
+    // NOTE: <Say> here is the ONLY allowed Twilio Say in this project
+    // (A.13 exception: out-of-band control prompt to human agent only,
+    //  never heard by the customer).
+    // ============================================================
+
+    // POST /bc-transfer-call?mode=agent_accept_prompt
+    if (path === "/bc-transfer-call" && urlParams.get("mode") === "agent_accept_prompt" && req.method === "POST") {
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", () => {
+        const params = new URLSearchParams(body);
+        const conferenceName = urlParams.get("conference_name") || "";
+        const customerCallSid = urlParams.get("call_sid") || "";
+        const lang = (urlParams.get("lang") || "en").toLowerCase();
+        const agentCallSid = params.get("CallSid") || "";
+        const GATEWAY_BASE = process.env.GATEWAY_URL || `https://${req.headers.host}`;
+        const ts = new Date().toISOString();
+
+        logger.info("[conference] agent_accept_prompt_played", {
+          callSid: customerCallSid, agentCallSid, conferenceName, lang, ts,
+        });
+
+        const actionUrl = `${GATEWAY_BASE}/bc-transfer-call?mode=agent_accept_result`
+          + `&conference_name=${encodeURIComponent(conferenceName)}`
+          + `&call_sid=${encodeURIComponent(customerCallSid)}`;
+
+        const isSpanish = lang.startsWith("es");
+        const voice = isSpanish ? "Polly.Lupe" : "Polly.Joanna";
+        const language = isSpanish ? "es-US" : "en-US";
+        const promptText = isSpanish
+          ? "Tienes una llamada de un cliente que quiere hablar contigo. Presiona 1 para aceptar o 2 para rechazar."
+          : "You have a call from a customer who wants to speak with you. Press 1 to accept or 2 to decline.";
+        const noInputText = isSpanish ? "No se recibio entrada. Adios." : "No input received. Goodbye.";
+
+        res.writeHead(200, { "Content-Type": "text/xml" });
+        res.end(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather numDigits="1" timeout="20" method="POST" action="${actionUrl}">
+    <Say voice="${voice}" language="${language}">${promptText}</Say>
+  </Gather>
+  <Say language="${language}">${noInputText}</Say>
+  <Hangup/>
+</Response>`);
+      });
+      return;
+    }
+
+    // POST /bc-transfer-call?mode=agent_accept_result
+    if (path === "/bc-transfer-call" && urlParams.get("mode") === "agent_accept_result" && req.method === "POST") {
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", async () => {
+        const params = new URLSearchParams(body);
+        const digits = params.get("Digits") || "";
+        const agentCallSid = params.get("CallSid") || "";
+        const conferenceName = urlParams.get("conference_name") || "";
+        const customerCallSid = urlParams.get("call_sid") || "";
+        const GATEWAY_BASE = process.env.GATEWAY_URL || `https://${req.headers.host}`;
+        const ts = new Date().toISOString();
+
+        logger.info("[conference] agent_accept_dtmf_received", {
+          agentCallSid, digits, conferenceName, customerCallSid, ts,
+        });
+
+        if (digits === "1") {
+          logger.info("[conference] agent_accepted_transfer", { agentCallSid, conferenceName, customerCallSid, ts });
+          // A.13: mark this agent leg as accepted so agent-leg-status completed doesn't fire agent_accept_timeout
+          global[`agent_accepted_${agentCallSid}`] = true;
+          res.writeHead(200, { "Content-Type": "text/xml" });
+          res.end(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Dial>
+    <Conference
+      statusCallback="${GATEWAY_BASE}/voice/conference-status"
+      statusCallbackEvent="start end join leave"
+      statusCallbackMethod="POST"
+      endConferenceOnExit="true"
+      beep="false">${conferenceName}</Conference>
+  </Dial>
+</Response>`);
+        } else {
+          // digits === '2' or any other input
+          logger.info("[conference] agent_declined_transfer", { agentCallSid, digits, conferenceName, customerCallSid, ts });
+          // Redirect customer to fallback asynchronously
+          if (customerCallSid) {
+            const acctSid = process.env.TWILIO_ACCOUNT_SID;
+            const authToken = process.env.TWILIO_AUTH_TOKEN;
+            if (acctSid && authToken) {
+              const apiUrl = `https://api.twilio.com/2010-04-01/Accounts/${acctSid}/Calls/${customerCallSid}.json`;
+              const fallbackTwiml = `<Response><Say voice="Polly.Joanna" language="en-US">Sorry, the agent is not available right now. Please try again later.</Say><Hangup/></Response>`;
+              fetch(apiUrl, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/x-www-form-urlencoded",
+                  "Authorization": "Basic " + Buffer.from(`${acctSid}:${authToken}`).toString("base64"),
+                },
+                body: new URLSearchParams({ Twiml: fallbackTwiml }).toString(),
+              }).then(r => {
+                if (r.ok) logger.info("[conference] customer_fallback_played", { customerCallSid, reason: "agent_declined", ts });
+                else logger.warn("[conference] customer_fallback_redirect_failed", { customerCallSid, status: r.status, ts });
+              }).catch(err => logger.warn("[conference] customer_fallback_redirect_failed", { customerCallSid, err: err.message, ts }));
+            }
+          }
+          res.writeHead(200, { "Content-Type": "text/xml" });
+          res.end(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say language="en-US">Transfer declined. Goodbye.</Say>
+  <Hangup/>
+</Response>`);
+        }
       });
       return;
     }
