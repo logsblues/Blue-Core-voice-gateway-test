@@ -80,7 +80,7 @@ import http from "http";
 // SECTION 1: CONFIGURATION & CONSTANTS
 // ============================================================
 
-const VERSION = "12.0.0";
+const VERSION = "12.1.0";
 const PORT = process.env.PORT || 10000;
 
 // Environment variables (required)
@@ -4049,7 +4049,12 @@ class OpenAIHandler {
         case "error": {
           const errCode = event.error?.code || event.code;
           const errMsg  = event.error?.message || "";
-          logger.error("OpenAI error", { callSid: session.callSid, error: JSON.stringify(event.error) });
+          // A.8.1: Downgrade benign race conditions from ERROR to INFO/WARN
+          if (errCode === "response_cancel_not_active") {
+            // Warm transfer race: we cancelled after OpenAI already finished the response. Benign.
+            logger.info('[openai] benign_cancel_race', { callSid: session.callSid, code: errCode });
+            break;
+          }
           // v7.5.0: benign race — drop duplicate, do NOT crash or re-queue
           if (errCode === "conversation_already_has_active_response" || errMsg.includes("conversation_already_has_active_response")) {
             logger.warn('[v7.5.0] conversation_already_has_active_response — dropping duplicate (benign race)', {
@@ -4057,6 +4062,7 @@ class OpenAIHandler {
             });
             break;
           }
+          logger.error("OpenAI error", { callSid: session.callSid, error: JSON.stringify(event.error) });
           // v7.4.4: Circuit breaker — unknown_parameter in response.* (no retry)
           if (errCode === "unknown_parameter" && /^response\./.test(errMsg)) {
             logger.error("[v7.4.4] response.create GA shape invalid — closing session", {
@@ -4358,17 +4364,34 @@ class InterpreterRuntimeListener {
         }
       }
 
+      // A.8.2: Stop if session is gone (call ended, session cleaned up)
+      if (!sessions.has(callSid)) {
+        logger.info('[interpreter-voice] poller_stopped_session_gone', { callSid, prepId });
+        this.stop();
+        return;
+      }
+
       if (!row) {
         // v12.1.2: Only warn when prepId is set — bridge sessions have no prepId and
         // should not spam logs with interpreter_flag_polled_no_row every 3 seconds.
         if (prepId) {
+          this._emptyPolls = (this._emptyPolls || 0) + 1;
+          const MAX_EMPTY_POLLS = 10; // ~30s without a row → stop
+          if (this._emptyPolls >= MAX_EMPTY_POLLS) {
+            logger.info('[interpreter-voice] poller_stopped_max_empty', {
+              callSid, prepId, emptyPolls: this._emptyPolls,
+            });
+            this.stop();
+            return;
+          }
           logger.warn('[interpreter-voice] interpreter_flag_polled_no_row', {
-            callSid, prepId, ts: new Date().toISOString(),
+            callSid, prepId, emptyPolls: this._emptyPolls, ts: new Date().toISOString(),
           });
         }
         this._schedule();
         return;
       }
+      this._emptyPolls = 0; // reset counter when row appears
 
       logger.info('[interpreter-voice] interpreter_flag_polled', {
         table: tableUsed,
