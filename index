@@ -3025,6 +3025,16 @@ class ToolExecutor {
 
   static async execute(session, toolName, callId, args) {
     // ✅ FIX BUG-2: Allow transfer_to_human even if callEnding is active (race condition guard)
+    // v12.1.3: Alias legacy transfer_call → transfer_to_human.
+    // The model sometimes calls "transfer_call" (old tool name). Map it here so
+    // bc-transfer-call v3.0 is always invoked regardless of which name is used.
+    if (toolName === "transfer_call") {
+      logger.warn("[v12.1.3] transfer_call aliased to transfer_to_human", {
+        callSid: session.callSid, originalTool: "transfer_call",
+      });
+      toolName = "transfer_to_human";
+    }
+
     if (session.callEnding && toolName !== "transfer_to_human") {
       logger.debug("Tool blocked (call ending)", { toolName, callSid: session.callSid });
       return;
@@ -3168,8 +3178,13 @@ class ToolExecutor {
         // Only request a response if NOT ending the call
         if (!session.callEnding) {
           // ── v7.3.6 FIX: skip AI response if screening is active ──
+          // v12.1.3: also skip if transfer is in progress (prevents duplicate/race)
           if (session.screeningActive && toolName === "transfer_to_human") {
             logger.info("[TOOL_RESULT] Skipping response.create — screening active", {
+              callSid: session.callSid
+            });
+          } else if (session.transferInProgress && toolName === "transfer_to_human") {
+            logger.info("[TOOL_RESULT] Skipping response.create — transfer in progress", {
               callSid: session.callSid
             });
           } else {
@@ -3460,13 +3475,53 @@ class ToolExecutor {
             session.interpreterRuntimeListener.start();
           }
 
-          // Update call record (non-critical)
-          try {
-            await SupabaseClient.request("calls?call_sid=eq." + callSid, "PATCH", {
-              transferred_to_agent_id: humanAgentId,
+          // Update call record (non-critical) — v12.1.3: use voicecore_calls, log errors
+          (async () => {
+            const patchPayload = {
+              transferred_to_agent_id: resolvedHumanAgentId,
               call_state: "transferred",
-            });
-          } catch (_) {}
+            };
+            // Try voicecore_calls first (primary table post-v12)
+            try {
+              const r1 = await SupabaseClient.request(
+                "voicecore_calls?call_sid=eq." + callSid, "PATCH", patchPayload
+              );
+              if (r1.ok) {
+                logger.info("[transfer_to_human] call_record_patched", {
+                  callSid, table: "voicecore_calls",
+                });
+                return;
+              }
+              logger.warn("[transfer_to_human] voicecore_calls PATCH failed", {
+                callSid, table: "voicecore_calls", status: r1.status,
+                payload: patchPayload, body: r1.data,
+              });
+            } catch (e1) {
+              logger.warn("[transfer_to_human] voicecore_calls PATCH exception", {
+                callSid, error: e1.message,
+              });
+            }
+            // Fallback: try legacy calls table
+            try {
+              const r2 = await SupabaseClient.request(
+                "calls?call_sid=eq." + callSid, "PATCH", patchPayload
+              );
+              if (r2.ok) {
+                logger.info("[transfer_to_human] call_record_patched", {
+                  callSid, table: "calls",
+                });
+                return;
+              }
+              logger.warn("[transfer_to_human] calls PATCH failed", {
+                callSid, table: "calls", status: r2.status,
+                payload: patchPayload, body: r2.data,
+              });
+            } catch (e2) {
+              logger.warn("[transfer_to_human] calls PATCH exception", {
+                callSid, error: e2.message,
+              });
+            }
+          })();
 
           // Close OpenAI WS; keep Twilio WS alive for agent voice detection.
           // Phase A: do NOT close session.twilioWs manually.
@@ -4895,6 +4950,44 @@ class TwilioHandler {
       if (bridgeCustomerCallSid) session.customerCallSid = bridgeCustomerCallSid;
       // Register session so cleanup works correctly
       sessions.set(session.callSid, session);
+
+      // v12.1.3: Conference stream lifecycle logs
+      logger.info('[conference] conference_stream_started', {
+        callSid: session.callSid,
+        conferenceName: bridgeConferenceName,
+        customerCallSid: bridgeCustomerCallSid,
+        agentId: session.agentId,
+        companyId: session.companyId,
+        ts: new Date().toISOString(),
+      });
+
+      // Track participant events from customParameters
+      const participantStatus = params.participantStatus || params.participant_status || null;
+      const participantCallSid = params.participantCallSid || params.participant_call_sid || null;
+      const participantType = params.participantType || params.participant_type || null; // 'customer' | 'agent'
+
+      if (participantStatus === 'joined' || params.customerJoined === 'true') {
+        logger.info('[conference] conference_participant_joined_customer', {
+          callSid: session.callSid, conferenceName: bridgeConferenceName,
+          customerCallSid: bridgeCustomerCallSid,
+        });
+      }
+      if (participantStatus === 'agent_joined' || params.agentJoined === 'true') {
+        logger.info('[conference] conference_participant_joined_agent', {
+          callSid: session.callSid, conferenceName: bridgeConferenceName,
+          agentCallSid: participantCallSid,
+        });
+        logger.info('[conference] agent_answered', {
+          callSid: session.callSid, conferenceName: bridgeConferenceName,
+          agentCallSid: participantCallSid,
+        });
+      }
+      if (participantStatus === 'agent_no_answer' || params.agentNoAnswer === 'true') {
+        logger.warn('[conference] agent_no_answer', {
+          callSid: session.callSid, conferenceName: bridgeConferenceName,
+        });
+      }
+
       // Do NOT load agent config, do NOT connect to OpenAI, do NOT send response.create.
       return;
     }
@@ -5229,11 +5322,36 @@ OUTPUT FORMAT:
     logger.info("Twilio stream stopped", { callSid: session.callSid });
     session.metrics.t_call_ended = Date.now();
 
+    // v12.1.3: Conference lifecycle — log conference end events
+    if (session.bridgeMode && session.conferenceName) {
+      logger.info('[conference] conference_ended', {
+        callSid: session.callSid,
+        conferenceName: session.conferenceName,
+        customerCallSid: session.customerCallSid || null,
+        durationMs: session.metrics.t_call_ended - (session.metrics.t_session_created || session.metrics.t_call_ended),
+      });
+    }
+    if (session.humanBridgeActive && session.conferenceName) {
+      logger.info('[conference] customer_hangup_during_conference', {
+        callSid: session.callSid,
+        conferenceName: session.conferenceName,
+      });
+    }
+
     // NEW: Notify screening system of customer hangup
     if (session.screeningActive) {
       CallScreeningEngine.handleCustomerHangup(session).catch(e =>
         logger.warn("[SCREENING] Hangup notification failed", { error: e.message })
       );
+    }
+
+    // v12.1.3: Log participant left for bridge sessions
+    if (session.bridgeMode && session.conferenceName) {
+      logger.info('[conference] conference_participant_left', {
+        callSid: session.callSid,
+        conferenceName: session.conferenceName,
+        customerCallSid: session.customerCallSid || null,
+      });
     }
 
     // v12.1.0-A.2: Stop interpreter runtime listener on stream stop to prevent poll leak
