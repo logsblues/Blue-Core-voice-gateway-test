@@ -1302,9 +1302,63 @@ class SupabaseClient {
         }
 
         // 6. Load human agents for transfer
-        const humanRes = await this.request("agents_new?company_id=eq." + effectiveCompanyId + "&type=eq.human&status=eq.active&availability=eq.available&select=id,display_name,phone,dial_target,transfer_number");  // ✅ FIX BUG-6: only available agents
-        if (humanRes.ok && humanRes.data) {
-          config.humanAgents = humanRes.data.map(a => ({ id: a.id, name: a.display_name, phone: a.dial_target || a.phone || a.transfer_number || null }));
+        // Phase A.3+A.4: Use company_human_agents (status=active, NO availability filter).
+        // availability is used only for ordering/priority, NOT for exclusion.
+        // bc-transfer-call decides whether to ring the agent.
+        const COMPANY_HUMAN_FALLBACK = {
+          // Zabdy LLC Multiservices — temporary static fallback
+          'fba8b63e-1985-472f-92ca-7894d481874c': {
+            id: 'bccdba86-249c-4def-b714-390dbc7cb45e',
+            name: 'Layla Reyna',
+            phone: '+14704486241',
+            role: 'agent',
+            fromFallback: true,
+          },
+        };
+        try {
+          const humanUrl = `${SUPABASE_URL}/rest/v1/company_human_agents`
+            + `?company_id=eq.${encodeURIComponent(effectiveCompanyId)}`
+            + `&status=eq.active`
+            + `&select=id,display_name,phone,extension,role,current_availability`;
+          logger.info("[transfer_to_human] human loader query", {
+            companyId: effectiveCompanyId, table: "company_human_agents",
+          });
+          const humanResp = await fetch(humanUrl, {
+            headers: {
+              "apikey": SUPABASE_SERVICE_KEY,
+              "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
+            },
+          });
+          const humanRows = humanResp.ok ? await humanResp.json().catch(() => []) : [];
+          let humanAgents = (humanRows || [])
+            .filter(a => a.phone && /^\+\d{8,}$/.test(a.phone))
+            .map(a => ({
+              id: a.id,
+              name: a.display_name,
+              phone: a.phone,
+              role: a.role,
+              availability: a.current_availability,
+            }));
+          // A.4: Fallback if no active human with E.164 phone found
+          if (humanAgents.length === 0 && COMPANY_HUMAN_FALLBACK[effectiveCompanyId]) {
+            logger.warn("[transfer_to_human] using company fallback human target", {
+              companyId: effectiveCompanyId,
+              fallback: COMPANY_HUMAN_FALLBACK[effectiveCompanyId].name,
+            });
+            humanAgents = [COMPANY_HUMAN_FALLBACK[effectiveCompanyId]];
+          }
+          config.humanAgents = humanAgents;
+        } catch (humanErr) {
+          logger.error("[transfer_to_human] human loader error", {
+            companyId: effectiveCompanyId, error: humanErr.message,
+          });
+          // A.4: Still apply fallback on error
+          if (COMPANY_HUMAN_FALLBACK[effectiveCompanyId]) {
+            logger.warn("[transfer_to_human] using company fallback human target (after error)", {
+              companyId: effectiveCompanyId,
+            });
+            config.humanAgents = [COMPANY_HUMAN_FALLBACK[effectiveCompanyId]];
+          }
         }
       }
     } catch (e) {
@@ -3290,7 +3344,31 @@ class ToolExecutor {
         } catch (_) {}
       }
 
-      if (!humanAgentId || !transferNumber) {
+      // A.4: Runtime fallback — if humanAgents was empty at config load time,
+      //      apply the static fallback now so bc-transfer-call can still be invoked.
+      const RUNTIME_FALLBACK = {
+        'fba8b63e-1985-472f-92ca-7894d481874c': {
+          id: 'bccdba86-249c-4def-b714-390dbc7cb45e',
+          name: 'Layla Reyna',
+          phone: '+14704486241',
+          fromFallback: true,
+        },
+      };
+      let resolvedHumanAgentId = humanAgentId;
+      let resolvedTransferNumber = transferNumber;
+      let resolvedTargetAgent = targetAgent;
+
+      if ((!resolvedHumanAgentId || !resolvedTransferNumber) && RUNTIME_FALLBACK[companyId]) {
+        const fb = RUNTIME_FALLBACK[companyId];
+        logger.warn("[transfer_to_human] using company fallback human target", {
+          callSid, companyId, fallbackName: fb.name, fallbackPhone: fb.phone,
+        });
+        resolvedHumanAgentId = resolvedHumanAgentId || fb.id;
+        resolvedTransferNumber = resolvedTransferNumber || fb.phone;
+        resolvedTargetAgent = resolvedTargetAgent || fb;
+      }
+
+      if (!resolvedHumanAgentId || !resolvedTransferNumber) {
         session.transferInProgress = false;
         logger.warn("[transfer_to_human] no human target resolved", {
           callSid,
@@ -3301,9 +3379,11 @@ class ToolExecutor {
       }
 
       logger.info("[transfer_to_human] resolved human target", {
-        callSid, companyId, aiAgentId, humanAgentId,
-        humanAgentName: targetAgent?.name || requestedAgentName,
-        transferNumber,
+        callSid, companyId, aiAgentId,
+        humanAgentId: resolvedHumanAgentId,
+        humanAgentName: resolvedTargetAgent?.name || requestedAgentName,
+        transferNumber: resolvedTransferNumber,
+        source: resolvedTargetAgent?.fromFallback ? 'fallback' : 'company_human_agents',
       });
 
       // Tell the AI to announce the transfer
@@ -3345,11 +3425,11 @@ class ToolExecutor {
             },
             body: JSON.stringify({
               callSid,
-              dial_target: transferNumber,
+              dial_target: resolvedTransferNumber,
               company_id: companyId,
-              agent_id: humanAgentId,
+              agent_id: resolvedHumanAgentId,
               ai_agent_id: aiAgentId,
-              agent_name: targetAgent?.name || requestedAgentName || null,
+              agent_name: resolvedTargetAgent?.name || requestedAgentName || null,
               reason: args?.reason || null,
             }),
           });
