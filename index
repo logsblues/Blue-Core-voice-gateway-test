@@ -3807,13 +3807,20 @@ class ToolExecutor {
       finalToolCount: finalTools.length,
     });
 
+    // A.15: In recovery mode, restrict to take_note + send_message + end_call only
+    const RECOVERY_TOOLS = ['take_note', 'send_message', 'end_call'];
+    const toolsToReturn = session.isRecovery
+      ? finalTools.filter(t => RECOVERY_TOOLS.includes(t.name || t.function?.name))
+      : finalTools;
+
     // A.5: Log final tool names so we can confirm transfer_to_human is registered
     logger.info('[realtime-tools] final tool names', {
       callSid: session?.callSid || 'prewarm',
-      names: finalTools.map(t => t.name || t.function?.name),
+      names: toolsToReturn.map(t => t.name || t.function?.name),
+      recoveryMode: !!session.isRecovery,
     });
 
-    return finalTools;
+    return toolsToReturn;
   }
 }
 
@@ -5239,6 +5246,10 @@ class TwilioHandler {
     const forceNewSession = params.forceNewSession === "true" || params.force_new_session === "true";
     const skipPrewarm = params.skipPrewarm === "true" || params.skip_prewarm === "true";
 
+    // A.15: Detect ai_recovery mode (bc-transfer-call sends mode=ai_recovery + transferFailed=true)
+    const isRecovery = params.mode === 'ai_recovery' || params.transferFailed === 'true';
+    if (isRecovery) session.isRecovery = true;
+
     // v7.1.0: Interpreter leg identification
     const interpreterLeg = params.interpreterLeg || params.interpreter_leg || null;
     if (interpreterLeg) session.interpreterLeg = interpreterLeg;
@@ -5262,6 +5273,21 @@ class TwilioHandler {
     if (fmB64) {
       const decoded = Parser.decodeBase64Utf8(fmB64);
       if (decoded) session.dynamicFirstMessage = decoded;
+    }
+
+    // A.15: If recovery mode, build minimal prompt that forces firstMessage and suppresses self-intro
+    if (isRecovery && session.dynamicFirstMessage) {
+      const recoveryLang = params.lang || params.customerLang || params.custLang || 'en';
+      session.recoveryLang = recoveryLang;
+      const fm = session.dynamicFirstMessage;
+      const recoveryPrompt = recoveryLang.startsWith('es')
+        ? `Eres un asistente de recepci\u00f3n. El agente humano no est\u00e1 disponible.\nREGLAS ABSOLUTAS:\n- Tu PRIMERA frase debe ser EXACTAMENTE: "${fm}"\n- NO te presentes, NO digas tu nombre, NO digas "gracias por llamar".\n- Despu\u00e9s, si el cliente quiere dejar un mensaje, toma nombre, n\u00famero y motivo, y usa la tool take_note.\n- Si el cliente se despide, usa end_call.\n- Habla SIEMPRE en espa\u00f1ol.`
+        : `You are a recovery receptionist. The human agent is unavailable.\nABSOLUTE RULES:\n- Your FIRST sentence MUST be EXACTLY: "${fm}"\n- Do NOT introduce yourself, do NOT say your name, do NOT say "thanks for calling".\n- After that, if the caller wants to leave a message, capture name, callback number and reason, then call take_note.\n- If the caller says goodbye, call end_call.\n- Always speak in English.`;
+      // Override instructions — mode=full so it replaces the full agent prompt
+      session.dynamicInstructions = recoveryPrompt;
+      session.dynamicInstructionsMode = 'full';
+      // Also stamp on config so sendSessionUpdate picks it up even on prewarm reuse
+      if (session.config) session.config.systemPrompt = recoveryPrompt;
     }
 
     if (preloadedContact) {
@@ -5740,6 +5766,28 @@ OUTPUT FORMAT:
         greeting_source: greetingSource,
         greeting_preview: greeting.substring(0, 100),
       });
+
+      // A.15: Recovery mode — audit log + forced response.create with instructions override
+      if (session.isRecovery) {
+        logger.info('[v12.1.0-A.15] ai_recovery mode active', {
+          callSid: session.callSid,
+          customerLang: session.recoveryLang || resolvedLang,
+          firstMessageLen: greeting.length,
+          promptSource: 'recovery_minimal',
+          toolCount: 3,
+        });
+        session.openaiWs.send(JSON.stringify({
+          type: 'conversation.item.create',
+          item: { type: 'message', role: 'user',
+            content: [{ type: 'input_text',
+              text: `[RECOVERY CALL - Agent unavailable. Speak in ${resolvedLang === 'es' ? 'Spanish' : 'English'}. Start immediately.]` }] }
+        }));
+        ResponseLockManager.sendResponseCreateSafe(session, {
+          type: 'response.create',
+          response: { instructions: `Say exactly this and nothing else, then wait for the caller: "${greeting}"` }
+        }, 'recovery_firstmessage');
+        return;
+      }
 
       if (session.config?.voiceProvider === "elevenlabs" && ELEVENLABS_API_KEY) {
         this._sendElevenLabsGreeting(session, greeting);
