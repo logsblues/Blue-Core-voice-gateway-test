@@ -213,6 +213,7 @@ const INTERPRETER_VOICE_PHRASES = [
 // Session pools
 const sessions = new Map();
 const prewarmSessions = new Map();
+const recoveryStore = new Map(); // A.17b: keyed by customerCallSid, TTL ~120s
 // ✅ FIX RES-4: LRU cache with max 500 entries
 class LRUCache {
   constructor(maxSize = 500) {
@@ -3301,13 +3302,16 @@ class ToolExecutor {
       args.note || args.content || args.message || ''
     );
     const finalIsMessage = isMessage || looksLikeMessage || !!session.isRecovery;
+    // A.17b: In recovery mode, pull caller_phone and for_human_agent_id from recoveryContext fields
+    const _rcPhone = session.from || session.fromNumber || session.customerPhone || null;
+    const _rcAgentId = session.recoveryHumanAgentId || session.humanAgentId || null;
     const enriched = {
       ...args,
       note_type: finalIsMessage ? 'message_for_agent' : (args.note_type || 'note'),
-      caller_phone: args.caller_phone || session.from || session.fromNumber || session.customerPhone || null,
-      callback_number: args.callback_number || null,
-      caller_name: args.caller_name || null,
-      for_human_agent_id: args.for_human_agent_id || session.humanAgentId || null,
+      caller_phone: args.caller_phone || _rcPhone || null,
+      callback_number: args.callback_number || args.caller_phone || _rcPhone || null,
+      caller_name: args.caller_name || session.contactName || null,
+      for_human_agent_id: args.for_human_agent_id || _rcAgentId || null,
     };
     logger.info('[v12.1.0-A.16] take_note enriched', {
       callSid: session.callSid,
@@ -3671,7 +3675,25 @@ class ToolExecutor {
             return;
           }
 
-          logger.info("[transfer_to_human] bc-transfer-call success", { callSid, result });
+           logger.info("[transfer_to_human] bc-transfer-call success", { callSid, result });
+
+          // A.17b: Persist recovery context so the recovery session can inherit lang + caller + agent
+          const _rcCtx = {
+            customerLang: session.customerLang || session.activeLang || 'en',
+            customerLangLocked: !!session.customerLangLocked,
+            callerPhone: session.from || session.fromNumber || session.customerPhone || null,
+            callerName: session.contactName || session.preloadedContact?.name || null,
+            humanAgentId: resolvedHumanAgentId,
+            humanAgentName: resolvedHumanAgentName,
+            companyId: session.companyId,
+            aiAgentId: session.agentId,
+          };
+          recoveryStore.set(callSid, _rcCtx);
+          setTimeout(() => recoveryStore.delete(callSid), 120000); // TTL 120s
+          logger.info('[v12.1.0-A.17b] recovery_context_stored', {
+            callSid, customerLang: _rcCtx.customerLang, hasCallerPhone: !!_rcCtx.callerPhone,
+            humanAgentId: _rcCtx.humanAgentId,
+          });
 
           // Activate interpreter voice detection on agent leg
           session.humanBridgeActive = true;
@@ -4110,6 +4132,7 @@ class OpenAIHandler {
             }
 
             // A.17: First-turn customer language detection (locks after first STT)
+            // A.17b: Skip entirely if already locked (e.g. hydrated from recoveryContext)
             if (!session.customerLangLocked) {
               const text = (event.transcript || '').trim();
               if (text.length >= 2) {
@@ -4126,8 +4149,9 @@ class OpenAIHandler {
                   await applyLanguageSwitch(session, detected);
                 }
               }
-            } else {
-              // Subsequent turns: use existing LanguageDetector for mid-call switches (future A.18)
+            }
+            // Subsequent turns: use existing LanguageDetector for mid-call switches (future A.18)
+            if (session.customerLangLocked) {
               const detectedLang = LanguageDetector.detect(event.transcript);
               if (detectedLang && detectedLang !== session.language) {
                 await LanguageDetector.updateSessionLanguage(session, detectedLang);
@@ -5366,6 +5390,33 @@ class TwilioHandler {
     const isRecovery = params.mode === 'ai_recovery' || params.transferFailed === 'true';
     if (isRecovery) session.isRecovery = true;
 
+    // A.17b: Hydrate recovery session from persisted recoveryContext
+    const _origCallSid = params.customerCallSid || params.customer_call_sid || params.origCallSid || null;
+    if (isRecovery && _origCallSid) {
+      const _rc = recoveryStore.get(_origCallSid);
+      if (_rc) {
+        session.customerLang        = _rc.customerLang;
+        session.activeLang          = _rc.customerLang;
+        session.customerLangLocked  = _rc.customerLangLocked;
+        session.from                = _rc.callerPhone || session.from;
+        session.fromNumber          = _rc.callerPhone || session.fromNumber;
+        session.contactName         = _rc.callerName  || session.contactName;
+        session.recoveryHumanAgentId   = _rc.humanAgentId;
+        session.recoveryHumanAgentName = _rc.humanAgentName;
+        session.companyId           = _rc.companyId || session.companyId;
+        session.agentId             = _rc.aiAgentId || session.agentId;
+        logger.info('[v12.1.0-A.17b] recovery_context_hydrated', {
+          callSid: session.callSid, origCallSid: _origCallSid,
+          customerLang: _rc.customerLang, customerLangLocked: _rc.customerLangLocked,
+          hasCallerPhone: !!_rc.callerPhone, humanAgentId: _rc.humanAgentId,
+        });
+      } else {
+        logger.warn('[v12.1.0-A.17b] recovery_context_not_found', {
+          callSid: session.callSid, origCallSid: _origCallSid,
+        });
+      }
+    }
+
     // v7.1.0: Interpreter leg identification
     const interpreterLeg = params.interpreterLeg || params.interpreter_leg || null;
     if (interpreterLeg) session.interpreterLeg = interpreterLeg;
@@ -5393,7 +5444,8 @@ class TwilioHandler {
 
     // A.15: If recovery mode, build minimal prompt that forces firstMessage and suppresses self-intro
     if (isRecovery && session.dynamicFirstMessage) {
-      const recoveryLang = params.lang || params.customerLang || params.custLang || 'en';
+      // A.17b: prefer hydrated customerLang over URL params
+      const recoveryLang = session.customerLang || params.lang || params.customerLang || params.custLang || 'en';
       session.recoveryLang = recoveryLang;
       const fm = session.dynamicFirstMessage;
       const recoveryPrompt = recoveryLang.startsWith('es')
