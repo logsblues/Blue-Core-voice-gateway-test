@@ -3508,9 +3508,36 @@ class ToolExecutor {
           });
 
           // A.10: Use mode=initiate so bc-transfer-call v3.0 runs whisper + DTMF accept flow
-          // Detect language preferences from session
+          // A.14: Resolve agent language
           const agentLang = session.config?.agentLanguage || session.agentLang || 'en';
-          const custLang = session.detectedCustomerLang || session.config?.defaultLanguage || 'en';
+
+          // A.14: Resolve customer language — NEVER fall back to agent language first
+          let customerLang = null;
+          let languageSource = 'none';
+          if (session.customerLang) {
+            customerLang = session.customerLang;
+            languageSource = 'session.customerLang';
+          } else if (session.contactLang) {
+            customerLang = session.contactLang;
+            languageSource = 'session.contactLang';
+          } else if (session.language) {
+            customerLang = session.language;
+            languageSource = 'session.language';
+          } else if (session.detectedLang) {
+            customerLang = session.detectedLang;
+            languageSource = 'session.detectedLang';
+          } else if (session.detectedCustomerLang) {
+            customerLang = session.detectedCustomerLang;
+            languageSource = 'session.detectedCustomerLang';
+          } else {
+            customerLang = 'en';
+            languageSource = 'default_en';
+          }
+          logger.info('[transfer_to_human] customer language attached', {
+            callSid, customerLang, languageSource,
+          });
+          // Keep custLang alias for legacy fields
+          const custLang = customerLang;
 
           const resp = await fetch(`${SUPABASE_URL}/functions/v1/bc-transfer-call?mode=initiate`, {
             method: "POST",
@@ -3525,6 +3552,7 @@ class ToolExecutor {
               companyId,
               agentLang,
               custLang,
+              customerLang,          // A.14: priority field — customer's preferred language
               // Legacy fields kept for backward compat with older bc-transfer-call versions
               callSid,
               dial_target: resolvedTransferNumber,
