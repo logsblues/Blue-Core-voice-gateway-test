@@ -1095,13 +1095,13 @@ setInterval(cleanupExpiredPrewarmSessions, 60_000); // ✅ v7.3.5: check every 6
 // SECTION 5: EXTERNAL SERVICES
 // ============================================================
 
-// A.9.2 — DB column whitelists to prevent 400 errors from unknown columns
+// A.9.2 / A.11.3 — DB column whitelists to prevent 400 errors from unknown columns
 // Confirmed schema for public.calls
 const CALLS_ALLOWED_COLUMNS = new Set([
   'call_sid', 'twilio_call_sid', 'status', 'direction', 'from_number', 'to_number',
-  'company_id', 'agent_id', 'duration_seconds', 'ended_at',
+  'company_id', 'agent_id', 'duration_seconds', 'ended_at', 'duration',
   'recording_url', 'transcript', 'disposition', 'updated_at',
-  'transferred_to_agent_id', 'call_state',
+  'transferred_to_agent_id', 'call_state', 'transfer_state',
 ]);
 
 // Confirmed schema for public.voicecore_calls
@@ -1109,6 +1109,12 @@ const VOICECORE_CALLS_ALLOWED_COLUMNS = new Set([
   'provider_call_sid', 'status', 'metadata', 'company_id', 'agent_id',
   'direction', 'from_number', 'to_number', 'started_at', 'ended_at',
   'duration_seconds', 'updated_at',
+  'transfer_state', 'human_agent_id', 'conference_name',
+]);
+
+// Confirmed schema for public.bc_call_prep_sessions
+const BC_CALL_PREP_ALLOWED_COLUMNS = new Set([
+  'status', 'ended_at', 'transfer_state', 'conference_name',
 ]);
 
 function sanitizeCallsPayload(payload) {
@@ -3891,11 +3897,26 @@ class OpenAIHandler {
               session.firstAudioSent = true;
               session.metrics.t_first_audio_sent = Date.now();
               TwilioHandler.stopRingback(session);
+              const m = session.metrics;
+              const streamStart = m.t_stream_start || m.t_session_created;
               logger.info("First audio sent", {
                 callSid: session.callSid,
                 crossRouted: !!session.interpreterPartner,
                 targetCallSid: session.interpreterPartner?.callSid || session.callSid,
-                latencyMs: session.metrics.t_first_audio_sent - (session.metrics.t_stream_start || session.metrics.t_session_created)
+                latencyMs: m.t_first_audio_sent - streamStart
+              });
+              // A.11.2: latency_report — one per call, emitted on first audio
+              logger.info("latency_report", {
+                callSid: session.callSid,
+                companyId: session.companyId,
+                agentId: session.agentId,
+                twiml_sent_ms: m.t_twiml_sent ? m.t_twiml_sent - m.t_session_created : null,
+                stream_start_ms: m.t_stream_start ? m.t_stream_start - m.t_session_created : null,
+                openai_ws_open_ms: m.t_openai_connected ? m.t_openai_connected - m.t_session_created : null,
+                first_audio_sent_ms: m.t_first_audio_sent - m.t_session_created,
+                supabase_load_ms: m.t_config_loaded ? m.t_config_loaded - m.t_session_created : null,
+                cold_start: !session.prepId,
+                ts: new Date().toISOString(),
               });
             }
             targetWs.send(JSON.stringify({
@@ -6211,6 +6232,164 @@ const server = http.createServer(async (req, res) => {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: error.message }));
         }
+      });
+      return;
+    }
+
+    // ============================================================
+    // A.11: Conference-controlled human transfer TwiML endpoints
+    // ============================================================
+
+    // POST /voice/transfer/customer-join
+    // Twilio redirects the customer leg here; customer waits in Conference with hold music.
+    if (path === "/voice/transfer/customer-join" && req.method === "POST") {
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", () => {
+        const params = new URLSearchParams(body);
+        const conf = urlParams.get("conf") || params.get("conf") || "";
+        const GATEWAY_BASE = process.env.GATEWAY_URL || `https://${req.headers.host}`;
+        logger.info("[conference] customer_join_twiml_served", { conf, ts: new Date().toISOString() });
+        res.writeHead(200, { "Content-Type": "text/xml" });
+        res.end(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Dial>
+    <Conference
+      startConferenceOnEnter="false"
+      endConferenceOnExit="false"
+      waitUrl="https://cdn.konezab.com/hold/konezab-hold.mp3"
+      statusCallback="${GATEWAY_BASE}/voice/transfer/conference-status?conf=${encodeURIComponent(conf)}"
+      statusCallbackEvent="start end join leave mute hold"
+      statusCallbackMethod="POST">${conf}</Conference>
+  </Dial>
+</Response>`);
+      });
+      return;
+    }
+
+    // POST /voice/transfer/agent-join
+    // Twilio calls the agent leg with this TwiML; agent enters Conference and starts it.
+    if (path === "/voice/transfer/agent-join" && req.method === "POST") {
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", () => {
+        const params = new URLSearchParams(body);
+        const conf = urlParams.get("conf") || params.get("conf") || "";
+        logger.info("[conference] agent_join_twiml_served", { conf, ts: new Date().toISOString() });
+        res.writeHead(200, { "Content-Type": "text/xml" });
+        res.end(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Dial>
+    <Conference
+      startConferenceOnEnter="true"
+      endConferenceOnExit="true"
+      beep="false">${conf}</Conference>
+  </Dial>
+</Response>`);
+      });
+      return;
+    }
+
+    // POST /voice/transfer/conference-status
+    // Twilio statusCallback for Conference events (join/leave/start/end).
+    if (path === "/voice/transfer/conference-status" && req.method === "POST") {
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", () => {
+        try {
+          const params = new URLSearchParams(body);
+          const conf = urlParams.get("conf") || params.get("FriendlyName") || "";
+          const event = params.get("StatusCallbackEvent") || "";
+          const callSid = params.get("CallSid") || "";
+          const participantCount = parseInt(params.get("ParticipantCount") || "0", 10);
+          const ts = new Date().toISOString();
+
+          if (event === "participant-join") {
+            // Heuristic: first join = customer, second = agent
+            if (participantCount === 1) {
+              logger.info("[conference] customer_joined_conference", { conf, callSid, participantCount, ts });
+            } else if (participantCount >= 2) {
+              logger.info("[conference] agent_joined_conference", { conf, callSid, participantCount, ts });
+              logger.info("[conference] bridge_connected", { conf, callSid, participantCount, ts });
+              logger.info("[conference] human_bridge_active", { conf, callSid, ts });
+            }
+          } else if (event === "participant-leave") {
+            logger.info("[conference] conference_participant_left", { conf, callSid, participantCount, ts });
+          } else if (event === "conference-end") {
+            logger.info("[conference] conference_ended", { conf, callSid, ts });
+          } else if (event === "conference-start") {
+            logger.info("[conference] conference_stream_started", { conf, callSid, ts });
+          }
+        } catch (e) {
+          logger.warn("[conference] conference_status_parse_error", { error: e.message });
+        }
+        res.writeHead(204);
+        res.end();
+      });
+      return;
+    }
+
+    // POST /voice/transfer/agent-status
+    // Twilio statusCallback for the outbound agent PSTN leg.
+    if (path === "/voice/transfer/agent-status" && req.method === "POST") {
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", async () => {
+        try {
+          const params = new URLSearchParams(body);
+          const callStatus = params.get("CallStatus") || "";
+          const agentCallSid = params.get("CallSid") || "";
+          const conf = urlParams.get("conf") || "";
+          const customerCallSid = urlParams.get("customer") || "";
+          const ts = new Date().toISOString();
+
+          if (["no-answer", "busy", "failed", "canceled"].includes(callStatus)) {
+            logger.warn("[conference] agent_no_answer", { agentCallSid, callStatus, conf, ts });
+            // Redirect customer to fallback TwiML
+            if (customerCallSid && TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
+              const GATEWAY_BASE = process.env.GATEWAY_URL || `https://${req.headers.host}`;
+              const twilioApiUrl = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${customerCallSid}.json`;
+              const fallbackUrl = `${GATEWAY_BASE}/voice/transfer/customer-fallback?reason=${callStatus}`;
+              const updateBody = new URLSearchParams({ Url: fallbackUrl, Method: "POST" }).toString();
+              await fetch(twilioApiUrl, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/x-www-form-urlencoded",
+                  "Authorization": "Basic " + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64"),
+                },
+                body: updateBody,
+              }).catch(err => logger.warn("[conference] customer_fallback_redirect_failed", { err: err.message }));
+            }
+          } else if (callStatus === "answered") {
+            logger.info("[conference] agent_answered", { agentCallSid, conf, ts });
+          } else if (callStatus === "completed") {
+            logger.info("[conference] agent_call_completed", { agentCallSid, conf, ts });
+          }
+        } catch (e) {
+          logger.warn("[conference] agent_status_parse_error", { error: e.message });
+        }
+        res.writeHead(204);
+        res.end();
+      });
+      return;
+    }
+
+    // POST /voice/transfer/customer-fallback
+    // Played to customer when agent doesn't answer or declines.
+    if (path === "/voice/transfer/customer-fallback" && req.method === "POST") {
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", () => {
+        const params = new URLSearchParams(body);
+        const reason = urlParams.get("reason") || params.get("reason") || "unavailable";
+        const callSid = params.get("CallSid") || "";
+        logger.info("[conference] customer_fallback_played", { callSid, reason, ts: new Date().toISOString() });
+        res.writeHead(200, { "Content-Type": "text/xml" });
+        res.end(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>https://cdn.konezab.com/audio/no_agent_available_en.mp3</Play>
+  <Hangup/>
+</Response>`);
       });
       return;
     }
