@@ -3384,6 +3384,12 @@ class ToolExecutor {
         return { success: false, error: "missing_session_context" };
       }
 
+      // A.10: Log the request immediately so we can trace even if resolution fails
+      logger.info("[transfer_to_human] transfer_to_human_requested", {
+        callSid, companyId, aiAgentId, args,
+        ts: new Date().toISOString(),
+      });
+
       // Resolve human agent from session.config.humanAgents
       const normalize = (v) => String(v || "")
         .trim().toLowerCase()
@@ -3495,18 +3501,31 @@ class ToolExecutor {
             callSid, companyId, aiAgentId, humanAgentId, transferNumber,
           });
 
-          const resp = await fetch(`${SUPABASE_URL}/functions/v1/bc-transfer-call`, {
+          // A.10: Use mode=initiate so bc-transfer-call v3.0 runs whisper + DTMF accept flow
+          // Detect language preferences from session
+          const agentLang = session.config?.agentLanguage || session.agentLang || 'en';
+          const custLang = session.detectedCustomerLang || session.config?.defaultLanguage || 'en';
+
+          const resp = await fetch(`${SUPABASE_URL}/functions/v1/bc-transfer-call?mode=initiate`, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
               "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
             },
             body: JSON.stringify({
+              // A.10 spec fields
+              customerCallSid: callSid,
+              agentId: resolvedHumanAgentId,
+              companyId,
+              agentLang,
+              custLang,
+              // Legacy fields kept for backward compat with older bc-transfer-call versions
               callSid,
               dial_target: resolvedTransferNumber,
               company_id: companyId,
               agent_id: resolvedHumanAgentId,
               ai_agent_id: aiAgentId,
+              source_ai_agent_id: aiAgentId,
               agent_name: resolvedTargetAgent?.name || requestedAgentName || null,
               reason: args?.reason || null,
             }),
