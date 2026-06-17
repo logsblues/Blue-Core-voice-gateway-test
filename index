@@ -818,7 +818,10 @@ class SessionManager {
       },
 
       // A.17: Customer language detection
-      customerLang: null,          // detected from first STT turn
+      customerLang: null,
+    awaitingCallerInput: false,
+    recoverySlots: null,
+    lockedLang: null,          // detected from first STT turn
       languageSource: 'unknown',   // 'stt' | 'contact' | 'agent_default'
       customerLangLocked: false,   // true after first STT detection
       activeLang: 'en',            // current active language for session.update
@@ -2481,6 +2484,23 @@ class LanguageDetector {
 // ============================================================
 // A.17: Customer language auto-detection helpers
 // ============================================================
+const LANG_LOCK_MIN_CHARS = 6;
+
+
+// A.18-D: clearTwilioAudio — flush buffered audio from Twilio media stream
+function clearTwilioAudio(session) {
+  if (!session.twilioWs || !session.streamSid) return;
+  try {
+    session.twilioWs.send(JSON.stringify({
+      event: 'clear',
+      streamSid: session.streamSid,
+    }));
+  } catch (e) {
+    logger.warn('[twilio] clear_failed', { callSid: session.callSid, err: String(e) });
+  }
+}
+
+
 function detectLang(text, fallback) {
   const t = text.toLowerCase();
   const esHits = (t.match(/\b(hola|buenas|gracias|por favor|necesito|quiero|estoy|se\u00f1or|se\u00f1ora|c\u00f3mo|qu\u00e9|s\u00ed|est\u00e1|usted|tambi\u00e9n|llamando|informaci\u00f3n|disponible|tardes|d\u00edas|noches)\b/g) || []).length;
@@ -2491,23 +2511,93 @@ function detectLang(text, fallback) {
   return fallback || 'en';
 }
 
-async function applyLanguageSwitch(session, toLang) {
-  const fromLang = session.activeLang;
-  session.activeLang = toLang;
-  session.language = toLang;
-  session.customerLang = toLang;
-  // Reset sessionUpdated so sendSessionUpdate sends a fresh update
+// A.18-C: maybeDetectAndSwitchLanguage — called on every STT transcript
+function maybeDetectAndSwitchLanguage(session, transcript) {
+  if (!transcript || transcript.trim().length < LANG_LOCK_MIN_CHARS) return;
+  if (session.customerLangLocked) return; // already locked after first reliable transcript
+
+  const detected = detectLang(transcript, session.activeLang);
+  if (!detected) return;
+
+  logger.info('[lang_detect] customer language detected', {
+    callSid: session.callSid,
+    detected,
+    transcriptPreview: transcript.slice(0, 60),
+  });
+
+  if (detected !== session.activeLang) {
+    applyLanguageSwitch(session, detected, 'customer_language_detected');
+  } else {
+    session.customerLangLocked = true;
+    session.lockedLang = detected;
+    session.customerLang = detected;
+  }
+}
+
+
+function applyLanguageSwitch(session, newLang, reason = 'customer_language_detected') {
+  const oldLang = session.activeLang;
+
+  if (oldLang === newLang) return;
+  if (session.customerLangLocked && session.lockedLang === newLang) return;
+
+  session.activeLang = newLang;
+  session.language   = newLang;
+  session.customerLang = newLang;
+
+  logger.info('[lang_switch] applied', {
+    callSid: session.callSid,
+    fromLang: oldLang,
+    toLang: newLang,
+    reason,
+  });
+
+  // 1) Cancel active response WITHOUT response_id (spec A.18-B)
+  if (session.activeResponseId) {
+    try {
+      session.openaiWs.send(JSON.stringify({ type: 'response.cancel' }));
+      logger.info('[lang_switch] active_response_cancelled', {
+        callSid: session.callSid,
+        responseId: session.activeResponseId,
+        fromLang: oldLang,
+        toLang: newLang,
+      });
+    } catch (e) {
+      logger.warn('[lang_switch] cancel_failed', { callSid: session.callSid, err: String(e) });
+    }
+    session.activeResponseId = null;
+  }
+
+  // 2) Flush buffered Twilio audio
+  clearTwilioAudio(session);
+
+  // 3) Send updated session.update with new language prompt
   session.sessionUpdated = false;
   session._sessionUpdateSent = false;
   if (session.sessionReady && session.openaiWs?.readyState === WebSocket.OPEN && session.config) {
     OpenAIHandler.sendSessionUpdate(session);
-    logger.info('[lang_switch] applied', {
-      callSid: session.callSid,
-      fromLang,
-      toLang,
-      promptLength: PromptBuilder.build(session, session.config).length,
-    });
   }
+
+  // 4) Force a new response in the correct language
+  const langInstruction = newLang === 'es'
+    ? 'Responde en español ahora, desde esta misma frase. No mezcles inglés.'
+    : 'Respond in English now, starting this sentence. Do not mix Spanish.';
+
+  try {
+    session.openaiWs.send(JSON.stringify({
+      type: 'response.create',
+      response: { instructions: langInstruction },
+    }));
+    logger.info('[lang_switch] response_recreated_in_new_language', {
+      callSid: session.callSid, toLang: newLang,
+    });
+  } catch (e) {
+    logger.warn('[lang_switch] response_create_failed', { callSid: session.callSid, err: String(e) });
+  }
+
+  // 5) Lock to prevent ping-pong re-switches
+  session.customerLangLocked = true;
+  session.lockedLang = newLang;
 }
 
 // ============================================================
@@ -3141,6 +3231,12 @@ class EnforcementOrchestrator {
   }
 }
 
+// A.17d: Goodbye detector — short-circuit to end_call in recovery
+function isCallerGoodbye(text) {
+  return /^(bye|goodbye|adios|adi[oó]s|no gracias|no\.?|despu[eé]s|luego|thanks?|thank you|ok|okay)[.!?\s]*$/i
+    .test(String(text).trim());
+}
+
 // A.17c: Guard helpers — prevent invented/assistant-generated text from becoming CRM notes
 function isAssistantGeneratedMessage(text) {
   const t = String(text).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
@@ -3214,6 +3310,39 @@ class ToolExecutor {
      // A.16: Enrich take_note args with session fields before dispatch
     if (toolName === 'take_note') {
       args = ToolExecutor._injectMessageForAgentDefaults(toolName, args, session);
+    }
+
+    // A.17d: Recovery slots confirmation gate (runs before A.17c text guard)
+    if (toolName === 'take_note' && session.isRecovery) {
+      session.recoverySlots = session.recoverySlots || { name: null, phone: null, message: null, confirmed: false };
+      const s = session.recoverySlots;
+      // Update slots from args
+      if (args.caller_name) s.name = args.caller_name;
+      if (args.callback_number || args.caller_phone) s.phone = args.callback_number || args.caller_phone;
+      if (args.note || args.content || args.description || args.message) {
+        s.message = args.note || args.content || args.description || args.message;
+      }
+      // Mark confirmed when all three slots are present
+      if (s.name && s.phone && s.message) s.confirmed = true;
+      if (!s.name || !s.phone || !s.message || !s.confirmed) {
+        logger.warn('[A.17d] recovery_take_note_skipped_no_confirmation', {
+          callSid: session.callSid,
+          hasName: !!s.name, hasPhone: !!s.phone, hasMessage: !!s.message, confirmed: !!s.confirmed,
+        });
+        const gateResult = {
+          success: false,
+          error: 'RECOVERY_NOT_CONFIRMED',
+          message: session.activeLang === 'es'
+            ? 'Confirma con el cliente antes de guardar el mensaje.'
+            : 'Confirm with the caller before saving the message.',
+        };
+        ToolExecutor._sendToolResult(session, callId, gateResult, toolName);
+        return gateResult;
+      }
+      logger.info('[A.17d] recovery_take_note_called', {
+        callSid: session.callSid, hasName: !!s.name, hasPhone: !!s.phone,
+      });
+      logger.info('[A.17d] recovery_message_confirmed', { callSid: session.callSid });
     }
 
     // A.17c: Block unconfirmed message_for_agent notes (invented/assistant-generated text)
@@ -4171,32 +4300,10 @@ class OpenAIHandler {
               logger.info("[v6.4.0] Voicemail safety timer cancelled — human answered", { callSid: session.callSid });
             }
 
-            // A.17: First-turn customer language detection (locks after first STT)
-            // A.17b: Skip entirely if already locked (e.g. hydrated from recoveryContext)
-            if (!session.customerLangLocked) {
-              const text = (event.transcript || '').trim();
-              if (text.length >= 2) {
-                const detected = detectLang(text, session.activeLang);
-                session.customerLang = detected;
-                session.languageSource = 'stt';
-                session.customerLangLocked = true;
-                logger.info('[lang_detect] customer language detected', {
-                  callSid: session.callSid,
-                  detected,
-                  sample: text.slice(0, 60),
-                });
-                if (detected !== session.activeLang) {
-                  await applyLanguageSwitch(session, detected);
-                }
-              }
-            }
-            // Subsequent turns: use existing LanguageDetector for mid-call switches (future A.18)
-            if (session.customerLangLocked) {
-              const detectedLang = LanguageDetector.detect(event.transcript);
-              if (detectedLang && detectedLang !== session.language) {
-                await LanguageDetector.updateSessionLanguage(session, detectedLang);
-              }
-            }
+            // A.18-C: Language detection on every STT (locks after first reliable transcript)
+            // A.17b: Skips if already locked from recoveryContext hydration
+            maybeDetectAndSwitchLanguage(session, event.transcript);
+            if (session.customerLang) session.languageSource = 'stt';
 
             // ✅ v6.3.0 POINT D: Track user turn count
             session.userTurnCount = (session.userTurnCount || 0) + 1;
@@ -4214,6 +4321,18 @@ class OpenAIHandler {
                 userTurns: session.userTurnCount
               });
               await VoicemailDetector.handleDetection(session);
+            }
+            // A.17d: Turn lock — suppress response.create in recovery until caller speaks
+            if (session.isRecovery) {
+              session.awaitingCallerInput = false; // caller just spoke
+              const t = (event.transcript || '').trim();
+              if (isCallerGoodbye(t)) {
+                logger.info('[A.17d] recovery_customer_declined_message', {
+                  callSid: session.callSid, transcript: t,
+                });
+                ToolExecutor.execute(session, null, 'end_call', { reason: 'caller_declined_message' }).catch(() => {});
+                break;
+              }
             }
             // ── EnforcementOrchestrator HOOK 1: preResponse ──
             if (session.enforcer) {
@@ -4364,8 +4483,9 @@ class OpenAIHandler {
           const errMsg  = event.error?.message || "";
           // A.8.1: Downgrade benign race conditions from ERROR to INFO/WARN
           if (errCode === "response_cancel_not_active") {
-            // Warm transfer race: we cancelled after OpenAI already finished the response. Benign.
-            logger.info('[openai] benign_cancel_race', { callSid: session.callSid, code: errCode });
+            // A.18-A: Benign race — cancel arrived after response already finished
+            logger.debug('[lang_switch] cancel_no_active_response', { callSid: session.callSid });
+            session.activeResponseId = null;
             break;
           }
           // v7.5.0: benign race — drop duplicate, do NOT crash or re-queue
@@ -5488,19 +5608,11 @@ class TwilioHandler {
       const recoveryLang = session.customerLang || params.lang || params.customerLang || params.custLang || 'en';
       session.recoveryLang = recoveryLang;
       const fm = session.dynamicFirstMessage;
+      // A.17d: State-machine recovery prompt (replaces A.17c multi-line prompt)
+      const agentDisplayName = session.recoveryHumanAgentName || session.humanAgentName || 'the agent';
       const recoveryPrompt = recoveryLang.startsWith('es')
-        ? `Eres un asistente de recepci\u00f3n. El agente humano no est\u00e1 disponible.\nREGLAS ABSOLUTAS:\n- Tu PRIMERA frase debe ser EXACTAMENTE: "${fm}"\n- NO te presentes, NO digas tu nombre, NO digas "gracias por llamar".\n- Habla SIEMPRE en espa\u00f1ol.\n\nSI EL CLIENTE QUIERE DEJAR UN MENSAJE:\n1. Di: "Puedo tomarle un mensaje para el agente. Por favor d\u00edgame su nombre, el mejor n\u00famero para devolverle la llamada y el motivo de su llamada."\n2. Cuando el cliente diga el n\u00famero, rep\u00edtelo d\u00edgito por d\u00edgito: "Le repito el n\u00famero: [d\u00edgitos]. \u00bfEs correcto?"\n3. Confirma: "Perfecto, le voy a enviar este mensaje al agente ahora mismo."\n4. Llama take_note con note_type="message_for_agent" y el mensaje completo (nombre, n\u00famero, motivo).\n5. Desp\u00eddate brevemente y llama end_call.\n- Si el cliente se despide sin dejar mensaje, llama end_call directamente.
-Nunca inventes, resumas ni asumas un mensaje por el cliente.
-Solo llama take_note despu\u00e9s de que el cliente dicte contenido expl\u00edcito del mensaje con sus propias palabras.
-Si el cliente solo dice s\u00ed/no/adi\u00f3s/gracias, no llames take_note.
-Si el cliente quiere dejar un mensaje pero todav\u00eda no lo dict\u00f3, pide una vez el mensaje exacto y espera.
-No digas que el mensaje se est\u00e1 enviando hasta que take_note haya sido exitoso.`
-        : `You are a recovery receptionist. The human agent is unavailable.\nABSOLUTE RULES:\n- Your FIRST sentence MUST be EXACTLY: "${fm}"\n- Do NOT introduce yourself, do NOT say your name, do NOT say "thanks for calling".\n- Always speak in English.\n\nIF THE CALLER WANTS TO LEAVE A MESSAGE:\n1. Say: "I can take a message for the agent. Please tell me your name, the best callback number, and the reason for your call."\n2. When the caller gives the number, repeat it digit by digit: "Let me repeat the number: [digits]. Is that correct?"\n3. Confirm: "Perfect, I'm sending this message to the agent right now."\n4. Call take_note with note_type="message_for_agent" and the full message (name, number, reason).\n5. Say goodbye briefly and call end_call.\n- If the caller says goodbye without leaving a message, call end_call directly.
-Never invent, summarize, or assume a message for the caller.
-Only call take_note after the caller provides explicit message content in their own words.
-If the caller says only yes/no/bye/thanks, do not call take_note.
-If the caller wants to leave a message but has not dictated it yet, ask once for the exact message and wait.
-Do not say the message is being sent until take_note succeeds.`;
+        ? `Eres un asistente en MODO RECUPERACI\u00d3N. El agente humano no est\u00e1 disponible.\n\nREGLAS SIEMPRE:\n- Habla SOLO la siguiente l\u00ednea requerida. Nunca monologues. Nunca te repitas a menos que el cliente lo pida.\n- Despu\u00e9s de cada pregunta, DETENTE y espera al cliente. No produzcas otra respuesta hasta que el cliente hable.\n- Nunca inventes ni asumas el nombre, tel\u00e9fono o mensaje del cliente.\n- Si el cliente dice solo "bye / adi\u00f3s / no / no gracias / despu\u00e9s / gracias / ok", llama end_call de inmediato. NO llames take_note.\n- Solo llama take_note DESPU\u00c9S de que el cliente haya dictado expl\u00edcitamente un mensaje Y lo haya confirmado.\n\nM\u00c1QUINA DE ESTADOS:\n  S0 (entrada) \u2192 di exactamente una vez:\n      "${fm}"\n      Luego ESPERA.\n\n  S1 cliente declin\u00f3 (bye/no/etc.) \u2192 end_call.\n  S1 cliente acept\u00f3 pero faltan datos \u2192 pide UNA VEZ el campo faltante (nombre O n\u00famero O mensaje). Luego ESPERA.\n      Si sigue faltando despu\u00e9s de una pregunta \u2192 cierre amable + end_call. NO guardes.\n\n  S2 cuando nombre + n\u00famero + mensaje est\u00e9n presentes, confirma:\n      "Confirmo: su nombre es {nombre}, el n\u00famero es {tel\u00e9fono}, y el mensaje es: {mensaje}. \u00bfCorrecto?"\n      Luego ESPERA.\n\n  S3 cliente confirma ("s\u00ed/correcto") \u2192 llama take_note UNA VEZ con note_type="message_for_agent",\n      caller_phone, callback_number, caller_name, for_human_agent_id, y el texto verbatim del mensaje.\n      Luego di "Gracias, le enviar\u00e9 el mensaje." \u2192 end_call.\n\n  S3 cliente corrige \u2192 repregunta solo el campo corregido, luego vuelve a S2.`
+        : `You are in RECOVERY MODE. The human agent is unavailable.\n\nRules \u2014 ALWAYS:\n- Speak ONLY the next required line. Never monologue. Never repeat yourself unless the caller asks.\n- After every question, STOP and wait for the caller. Do not produce another response until the caller speaks.\n- Never invent or assume the caller's name, phone, or message.\n- If the caller says only "bye / goodbye / no / no thanks / later / thanks / ok", call end_call immediately. Do NOT call take_note.\n- Only call take_note AFTER the caller has explicitly dictated a message AND confirmed it.\n\nState machine:\n  S0  (entry) \u2192 say exactly once:\n      "${fm}"\n      Then WAIT.\n\n  S1  caller declined (bye/no/etc.) \u2192 end_call.\n  S1  caller accepted but missing data \u2192 ask ONCE for the missing field (name OR callback number OR message). Then WAIT.\n      If still missing after one ask \u2192 polite close + end_call. Do NOT save.\n\n  S2  once name + callback + message are present, confirm:\n      "Confirming: your name is {name}, callback number {phone}, message: {message}. Is that correct?"\n      Then WAIT.\n\n  S3  caller confirms ("yes/correct") \u2192 call take_note ONCE with note_type="message_for_agent",\n      caller_phone, callback_number, caller_name, for_human_agent_id, and the verbatim message text.\n      Then say "Thanks, I'll send the message." \u2192 end_call.\n\n  S3  caller corrects \u2192 re-ask only the corrected field, then back to S2.`;
       // Override instructions — mode=full so it replaces the full agent prompt
       session.dynamicInstructions = recoveryPrompt;
       session.dynamicInstructionsMode = 'full';
@@ -6000,10 +6112,15 @@ OUTPUT FORMAT:
             content: [{ type: 'input_text',
               text: `[RECOVERY CALL - Agent unavailable. Speak in ${resolvedLang === 'es' ? 'Spanish' : 'English'}. Start immediately.]` }] }
         }));
+        logger.info('[A.17d] recovery_prompt_started', {
+          callSid: session.callSid, lang: resolvedLang, greeting: greeting.slice(0, 80),
+        });
         ResponseLockManager.sendResponseCreateSafe(session, {
           type: 'response.create',
           response: { instructions: `Say exactly this and nothing else, then wait for the caller: "${greeting}"` }
         }, 'recovery_firstmessage');
+        session.awaitingCallerInput = true;
+        logger.info('[A.17d] recovery_waiting_for_customer_message', { callSid: session.callSid });
         return;
       }
 
@@ -6132,6 +6249,11 @@ OUTPUT FORMAT:
         if (res.ok && result?.success) {
           session.callDbId = result.id;
           logger.info("Call record upserted", { callSid: session.callSid, id: result.id });
+        } else if (res.ok && result && !result.success) {
+          // A.17d: Edge function returns 200 with {success:false} — log but do not throw
+          logger.warn('[A.17d] recovery_call_record_upsert_failed', {
+            callSid: session.callSid, code: result.code, error: result.error,
+          });
         } else {
           logger.warn("Call record upsert failed", { callSid: session.callSid, status: res.status });
         }
