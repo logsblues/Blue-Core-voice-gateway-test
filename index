@@ -822,6 +822,11 @@ class SessionManager {
     awaitingCallerInput: false,
     recoverySlots: null,
     lockedLang: null,          // detected from first STT turn
+    // v7.5.1: Outbound greeting grace
+    firstGreetingPlayed: false,
+    greetingResponseId: null,
+    greetingStartedAt: null,
+    amdSkipped: false,
       languageSource: 'unknown',   // 'stt' | 'contact' | 'agent_default'
       customerLangLocked: false,   // true after first STT detection
       activeLang: 'en',            // current active language for session.update
@@ -4195,6 +4200,14 @@ class OpenAIHandler {
             break;
           }
           // ── end fix ──
+          // v7.5.1: Detect first greeting audio chunk
+          if (!session.firstGreetingPlayed && session.activeResponseId === session.greetingResponseId) {
+            session.firstGreetingPlayed = true;
+            logger.info('[v7.5.1] outbound greeting audio started', {
+              callSid: session.callSid,
+              responseId: session.activeResponseId,
+            });
+          }
           // v7.1.0: Interpreter cross-routing
           // In interpreter mode, send translated audio to the PARTNER's stream
           let targetWs = session.twilioWs;
@@ -4358,8 +4371,44 @@ class OpenAIHandler {
             // ── end enforcement hook 1 ──
           }
           break;
-        case "input_audio_buffer.speech_started":
-          // v7.5.0: Barge-in — cancel active response if one is in flight
+        case "input_audio_buffer.speech_started": {
+          const GREETING_GRACE_MS = 2000;
+
+          // v7.5.1 §4a: Never cancel the greeting response itself (outbound only)
+          if (
+            session.direction === 'outbound' &&
+            session.activeResponseId &&
+            session.activeResponseId === session.greetingResponseId
+          ) {
+            logger.info('[v7.5.1] barge-in ignored: outbound greeting response protected', {
+              callSid: session.callSid,
+              responseId: session.activeResponseId,
+            });
+            break;
+          }
+
+          // v7.5.1 §4b: Outbound startup guard — require AMD + first audio + grace elapsed
+          if (session.direction === 'outbound') {
+            const amdReady = session.answeredBy === 'human' || session.amdSkipped === true;
+            const audioReady = session.firstGreetingPlayed === true;
+            const graceElapsed =
+              session.greetingStartedAt &&
+              Date.now() - session.greetingStartedAt >= GREETING_GRACE_MS;
+
+            if (!amdReady || !audioReady || !graceElapsed) {
+              logger.info('[v7.5.1] barge-in suppressed: outbound startup guard', {
+                callSid: session.callSid,
+                amdReady,
+                audioReady,
+                graceElapsed: !!graceElapsed,
+                activeResponseId: session.activeResponseId,
+                greetingResponseId: session.greetingResponseId,
+              });
+              break;
+            }
+          }
+
+          // v7.5.0 §4c: Existing cancel logic (unchanged for inbound + post-grace outbound)
           if (session.activeResponseId && !session.cancellingResponse) {
             logger.info('[v7.5.0] barge-in cancel sent', {
               callSid: session.callSid,
@@ -4380,10 +4429,20 @@ class OpenAIHandler {
             }, 1000);
           }
           break;
+        }
         case "response.created":
           session._hasActiveResponse = true; // ✅ v7.3.4: track active response
           // v7.5.0: Active Response Manager
           session.activeResponseId = event.response?.id || 'unknown';
+          // v7.5.1: Mark the first (greeting) response so barge-in can protect it
+          if (!session.firstGreetingPlayed && !session.greetingResponseId) {
+            session.greetingResponseId = session.activeResponseId;
+            session.greetingStartedAt = Date.now();
+            logger.info('[v7.5.1] outbound greeting marked', {
+              callSid: session.callSid,
+              responseId: session.greetingResponseId,
+            });
+          }
           logger.info('[v7.5.0] response.created', { callSid: session.callSid, id: session.activeResponseId });
           break;
 
@@ -5587,6 +5646,12 @@ class TwilioHandler {
       logger.info("[v7.2.9] Twilio AMD result", {
         callSid: session.callSid,
         answeredBy: session.answeredBy,
+      });
+    } else if (session.direction === 'outbound') {
+      // v7.5.1: AMD not present for this call — skip AMD gate so grace+audio check still works
+      session.amdSkipped = true;
+      logger.info('[v7.5.1] AMD skipped — outbound startup guard will rely on grace period', {
+        callSid: session.callSid,
       });
     }
 
