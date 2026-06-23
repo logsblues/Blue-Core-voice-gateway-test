@@ -827,6 +827,11 @@ class SessionManager {
     greetingResponseId: null,
     greetingStartedAt: null,
     amdSkipped: false,
+    // v7.5.2: Barge-in guard
+    activeResponseStartedAt: null,
+    lastUserTranscript: '',
+    earlyBargeInCount: 0,
+    likelyVoicemail: false,
       languageSource: 'unknown',   // 'stt' | 'contact' | 'agent_default'
       customerLangLocked: false,   // true after first STT detection
       activeLang: 'en',            // current active language for session.update
@@ -3252,6 +3257,34 @@ function isAssistantGeneratedMessage(text) {
     || /would you like to leave a message/.test(t)
     || /quieres dejar un mensaje|quiere dejar un mensaje/.test(t);
 }
+// v7.5.2: Barge-in guard constants
+const BARGE_IN_MIN_RESPONSE_AGE_MS = 600;
+const LOW_SIGNAL_PHRASES = [
+  /^thank you[.!? ]*$/i,
+  /^thanks[.!? ]*$/i,
+  /^(uh|um|ah|hmm)[.!? ]*$/i,
+  /^(ok|okay)[.!? ]*$/i,
+  /^(gracias|s[ií]|hola)[.!? ]*$/i,
+  /^(yes|no|yeah|nah)[.!? ]*$/i,
+  /^[.!? ]*$/,
+];
+
+function shouldIgnoreBargeIn(session) {
+  if (!session.activeResponseId) return { ignore: true, reason: 'no_active_response' };
+  const age = Date.now() - (session.activeResponseStartedAt || 0);
+  if (age < BARGE_IN_MIN_RESPONSE_AGE_MS) {
+    return { ignore: true, reason: `too_early_${age}ms` };
+  }
+  const lastUserText = (session.lastUserTranscript || '').trim();
+  if (!lastUserText) {
+    return { ignore: true, reason: 'no_user_transcript' };
+  }
+  if (LOW_SIGNAL_PHRASES.some((re) => re.test(lastUserText))) {
+    return { ignore: true, reason: `low_signal:${lastUserText.slice(0, 40)}` };
+  }
+  return { ignore: false };
+}
+
 function hasExplicitCallerMessage(text) {
   const t = String(text).trim();
   if (t.length < 3) return false;
@@ -4300,6 +4333,7 @@ class OpenAIHandler {
         case "conversation.item.input_audio_transcription.completed":
           if (event.transcript) {
             session.transcripts.user.push(event.transcript);
+            session.lastUserTranscript = event.transcript; // v7.5.2: track for barge-in guard
             logger.debug("User transcript", { callSid: session.callSid, transcript: event.transcript.substring(0, 100) });
             AutoHangupManager.cancelHangup(session);
 
@@ -4408,6 +4442,36 @@ class OpenAIHandler {
             }
           }
 
+          // v7.5.2 §4d: Barge-in guard — min age + low-signal transcript filter
+          const bargeDecision = shouldIgnoreBargeIn(session);
+          if (bargeDecision.ignore) {
+            logger.info('[barge-in] ignored', {
+              callSid: session.callSid,
+              reason: bargeDecision.reason,
+              activeResponseId: session.activeResponseId,
+            });
+            // v7.5.2: Voicemail-like detection — 3+ ignored barge-ins within first 8s
+            if (bargeDecision.reason !== 'no_active_response') {
+              session.earlyBargeInCount = (session.earlyBargeInCount || 0) + 1;
+              const callAge = Date.now() - (session.metrics?.t_session_created || Date.now());
+              if (session.earlyBargeInCount >= 3 && callAge < 8000 && !session.likelyVoicemail && !session.voicemailHandled) {
+                session.likelyVoicemail = true;
+                logger.warn('[v7.5.2] likely_voicemail_detected', {
+                  callSid: session.callSid,
+                  earlyBargeInCount: session.earlyBargeInCount,
+                  callAgeMs: callAge,
+                  lastUserTranscript: session.lastUserTranscript?.slice(0, 60),
+                });
+                VoicemailDetector.handleDetection(session).catch(err =>
+                  logger.error('[v7.5.2] handleDetection error from voicemail-like guard', {
+                    callSid: session.callSid, error: err.message
+                  })
+                );
+              }
+            }
+            break;
+          }
+
           // v7.5.0 §4c: Existing cancel logic (unchanged for inbound + post-grace outbound)
           if (session.activeResponseId && !session.cancellingResponse) {
             logger.info('[v7.5.0] barge-in cancel sent', {
@@ -4434,6 +4498,7 @@ class OpenAIHandler {
           session._hasActiveResponse = true; // ✅ v7.3.4: track active response
           // v7.5.0: Active Response Manager
           session.activeResponseId = event.response?.id || 'unknown';
+          session.activeResponseStartedAt = Date.now(); // v7.5.2: track age for barge-in guard
           // v7.5.1: Mark the first (greeting) response so barge-in can protect it
           if (!session.firstGreetingPlayed && !session.greetingResponseId) {
             session.greetingResponseId = session.activeResponseId;
